@@ -1,0 +1,73 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --primary: #0B6B3A;
+    --primary-hover: #08552E;
+    --saffron: #F28C28;
+    --saffron-hover: #D97517;
+    --mint: #EAF6EE;
+    --cream: #FFF6EC;
+    --charcoal: #1E2A32;
+    --border: #E6E9EC;
+  }
+
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    color: #1E2A32;
+    background-color: #F8FAFC;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: 'Plus Jakarta Sans', 'Poppins', sans-serif;
+  }
+}
+
+/* Indian Tricolor Header Strip */
+.gov-tricolor-bar {
+  background: linear-gradient(90deg, #FF9933 33.33%, #FFFFFF 33.33%, #FFFFFF 66.66%, #138808 66.66%);
+  height: 4px;
+  width: 100%;
+}
+
+/* Soft Gov Card Shadows */
+.gov-card {
+  background-color: #FFFFFF;
+  border-radius: 16px;
+  border: 1px solid #E6E9EC;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.04), 0 1px 2px -1px rgba(0, 0, 0, 0.04);
+}
+
+.gov-card-interactive {
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.gov-card-interactive:hover {
+  box-shadow: 0 4px 12px 0 rgba(11, 107, 58, 0.08);
+  border-color: #CBD5E1;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #F1F5F9;
+}
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  .print-only {
+    display: block !important;
+  }
+}
