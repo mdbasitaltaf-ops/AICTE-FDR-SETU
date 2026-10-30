@@ -1,7 +1,11 @@
 import React from 'react';
 import { Phone, Shield, ExternalLink, Lock } from 'lucide-react';
 
-export const Footer: React.FC = () => {
+interface FooterProps {
+  onOpenArchitecture?: () => void;
+}
+
+export const Footer: React.FC<FooterProps> = ({ onOpenArchitecture }) => {
   return (
     <footer className="bg-white border-t border-[#E6E9EC] text-[#526471] text-xs pt-10 pb-8 mt-16 no-print">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
@@ -24,6 +28,12 @@ export const Footer: React.FC = () => {
           </div>
 
           <div className="grid grid-cols-2 sm:grid-cols-2 gap-x-8 gap-y-2.5 text-xs">
+            <button
+              onClick={onOpenArchitecture}
+              className="text-left text-[#0B6B3A] font-semibold hover:underline flex items-center gap-1.5"
+            >
+              <span>›</span> System Architecture & Tech Box
+            </button>
             <a href="#charter" onClick={(e) => e.preventDefault()} className="hover:text-[#0B6B3A] transition-colors flex items-center gap-1.5">
               <span className="text-[#0B6B3A]">›</span> Citizen Charter
             </a>
@@ -36,9 +46,6 @@ export const Footer: React.FC = () => {
             <a href="#norms" onClick={(e) => e.preventDefault()} className="hover:text-[#0B6B3A] transition-colors flex items-center gap-1.5">
               <span className="text-[#0B6B3A]">›</span> AICTE Norms 2024-25
             </a>
-            <a href="#grievance" onClick={(e) => e.preventDefault()} className="hover:text-[#0B6B3A] transition-colors flex items-center gap-1.5">
-              <span className="text-[#0B6B3A]">›</span> Grievance Redressal
-            </a>
             <a href="#privacy" onClick={(e) => e.preventDefault()} className="hover:text-[#0B6B3A] transition-colors flex items-center gap-1.5">
               <span className="text-[#0B6B3A]">›</span> Privacy Policy
             </a>
@@ -47,12 +54,12 @@ export const Footer: React.FC = () => {
 
         <div className="pt-6 flex flex-col sm:flex-row items-center justify-between text-[11px] text-[#8899A6] gap-2">
           <p>© 2024 All India Council for Technical Education (AICTE). All Rights Reserved.</p>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <span className="flex items-center gap-1">
               <Lock className="w-3 h-3 text-[#0B6B3A]" /> 256-Bit SSL Encrypted
             </span>
             <span>·</span>
-            <span>Designed for National Technical Education Governance</span>
+            <span className="font-medium text-slate-600">Designed for National Technical Education Governance • Team [YOUR TEAM NAME]</span>
           </div>
         </div>
       </div>

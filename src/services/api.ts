@@ -175,6 +175,208 @@ export const api = {
     return res.json();
   },
 
+  // AICTE Document Extractor (Gemini Multimodal / Simulated fallback)
+  async extractDocument(payload: {
+    fileData?: string;
+    fileName?: string;
+    mimeType?: string;
+    typedData?: any;
+  }): Promise<{
+    success: boolean;
+    extractedData: any;
+    mismatches: string[];
+    isSimulated: boolean;
+    modeLabel: string;
+  }> {
+    const res = await fetch('/api/documents/extract', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Document extraction failed');
+    }
+    return res.json();
+  },
+
+  // State Machine Transition
+  async transitionFdr(
+    fdrId: string,
+    targetStatus: FDRStatus,
+    remarks: string,
+    officerName?: string,
+    role: string = 'officer',
+    overrideReason?: string
+  ): Promise<{ success: boolean; fdr: FDR }> {
+    const res = await fetch(`/api/fdrs/${fdrId}/transition`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetStatus, remarks, officerName, role, overrideReason }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Transition failed');
+    }
+    return res.json();
+  },
+
+  // Inline Officer Field Confirmation
+  async confirmOfficerFields(
+    fdrId: string,
+    confirmedFields: Record<string, string | number>,
+    officerName?: string
+  ): Promise<{ success: boolean; fdr: FDR }> {
+    const res = await fetch(`/api/fdrs/${fdrId}/confirm-fields`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirmedFields, officerName }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Field confirmation failed');
+    }
+    return res.json();
+  },
+
+  // Two-Step Forfeiture Workflow
+  async proposeForfeiture(
+    fdrId: string,
+    reason: string,
+    showCauseRef: string,
+    officerNote?: string,
+    officerName?: string
+  ): Promise<{ success: boolean; fdr: FDR }> {
+    const res = await fetch(`/api/fdrs/${fdrId}/propose-forfeiture`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason, showCauseRef, officerNote, officerName }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to propose forfeiture');
+    }
+    return res.json();
+  },
+
+  async approveForfeiture(
+    fdrId: string,
+    adminName?: string,
+    approvalNote?: string
+  ): Promise<{ success: boolean; fdr: FDR }> {
+    const res = await fetch(`/api/fdrs/${fdrId}/approve-forfeiture`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ adminName, approvalNote }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to approve forfeiture');
+    }
+    return res.json();
+  },
+
+  async rejectForfeiture(
+    fdrId: string,
+    adminName?: string,
+    rejectionReason?: string
+  ): Promise<{ success: boolean; fdr: FDR }> {
+    const res = await fetch(`/api/fdrs/${fdrId}/reject-forfeiture`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ adminName, rejectionReason }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to reject forfeiture');
+    }
+    return res.json();
+  },
+
+  async submitInstitutionResponse(
+    fdrId: string,
+    responseText: string,
+    submittedBy?: string
+  ): Promise<{ success: boolean; fdr: FDR }> {
+    const res = await fetch(`/api/fdrs/${fdrId}/institution-response`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ responseText, submittedBy }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to submit institutional response');
+    }
+    return res.json();
+  },
+
+  // Multi-signature Release Flow
+  async recommendRelease(
+    fdrId: string,
+    officerName?: string,
+    recommendationNote?: string
+  ): Promise<{ success: boolean; fdr: FDR }> {
+    const res = await fetch(`/api/fdrs/${fdrId}/recommend-release`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ officerName, recommendationNote }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to recommend release');
+    }
+    return res.json();
+  },
+
+  async countersignRelease(
+    fdrId: string,
+    adminName?: string,
+    countersignNote?: string
+  ): Promise<{ success: boolean; fdr: FDR }> {
+    const res = await fetch(`/api/fdrs/${fdrId}/countersign-release`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ adminName, countersignNote }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to countersign release');
+    }
+    return res.json();
+  },
+
+  // Tamper-Evident Hash-Chained Audit Verification
+  async verifyAuditIntegrity(): Promise<{
+    valid: boolean;
+    totalChecked: number;
+    headHash: string;
+    genesisHash: string;
+    brokenAtIndex?: number;
+    brokenAtId?: string;
+    reason?: string;
+    verifiedAt: string;
+  }> {
+    const res = await fetch('/api/audit/verify-integrity');
+    if (!res.ok) throw new Error('Failed to verify audit integrity');
+    return res.json();
+  },
+
+  // Proactive Alert Engine Run-Now
+  async runAlertsNow(): Promise<{
+    success: boolean;
+    summary: {
+      alertsGenerated: number;
+      maturityAlerts: number;
+      discrepancyAlerts: number;
+      lienPendingAlerts: number;
+    };
+    timestamp: string;
+  }> {
+    const res = await fetch('/api/alerts/run-now', { method: 'POST' });
+    if (!res.ok) throw new Error('Failed to run alert engine');
+    return res.json();
+  },
+
   // Notifications
   async getNotifications(role?: string, institutionId?: string): Promise<{ notifications: NotificationItem[] }> {
     const query = new URLSearchParams();

@@ -3,6 +3,8 @@ import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
+import { GoogleGenAI } from '@google/genai';
 import { 
   INITIAL_INSTITUTIONS, 
   INITIAL_USERS, 
@@ -16,7 +18,8 @@ import { AadhaarService } from './src/services/mock/aadhaarService';
 import { BankVerificationService } from './src/services/mock/bankVerificationService';
 import { DigiLockerService } from './src/services/mock/digilockerService';
 import { NotificationService } from './src/services/mock/notificationService';
-import { FDR, FDRRequest, NotificationItem, AuditLog, SystemSettings, User, Institution } from './src/types';
+import { RulesEngine } from './src/services/rulesEngine';
+import { FDR, FDRRequest, NotificationItem, AuditLog, SystemSettings, User, Institution, FDRStatus } from './src/types';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,6 +38,37 @@ interface DatabaseSchema {
   auditLogs: AuditLog[];
 }
 
+const GENESIS_HASH = '0000000000000000000000000000000000000000000000000000000000000000';
+
+function computeAuditHash(
+  prevHash: string,
+  entry: { id: string; action: string; entityId: string; performedBy: string; timestamp: string; details: string }
+): string {
+  const payload = `${prevHash}|${entry.id}|${entry.action}|${entry.entityId}|${entry.performedBy}|${entry.timestamp}|${entry.details}`;
+  return crypto.createHash('sha256').update(payload).digest('hex');
+}
+
+/**
+ * Re-chains the entire audit log array from oldest to newest.
+ */
+function ensureHashChainedAuditLogs(logs: AuditLog[]): AuditLog[] {
+  // Sort oldest first for chaining
+  const chronological = [...logs].sort(
+    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+  );
+
+  let runningHash = GENESIS_HASH;
+  for (let i = 0; i < chronological.length; i++) {
+    const item = chronological[i];
+    item.prevHash = runningHash;
+    item.hash = computeAuditHash(runningHash, item);
+    runningHash = item.hash;
+  }
+
+  // Return newest first for presentation
+  return chronological.reverse();
+}
+
 // In-memory cache + file-backed persistence
 let db: DatabaseSchema;
 
@@ -47,6 +81,25 @@ function loadDatabase(): DatabaseSchema {
       const raw = fs.readFileSync(DB_PATH, 'utf-8');
       const parsed = JSON.parse(raw);
       if (parsed.fdrs && parsed.users) {
+        // Ensure settings have all required attributes
+        parsed.settings = {
+          ...INITIAL_SETTINGS,
+          ...parsed.settings,
+          alertRules: {
+            ...INITIAL_SETTINGS.alertRules,
+            ...(parsed.settings?.alertRules || {}),
+          },
+          categoryThresholds: {
+            ...INITIAL_SETTINGS.categoryThresholds,
+            ...(parsed.settings?.categoryThresholds || {}),
+          },
+          scheduledBanks: parsed.settings?.scheduledBanks || INITIAL_SETTINGS.scheduledBanks,
+          minTenureYears: parsed.settings?.minTenureYears || INITIAL_SETTINGS.minTenureYears,
+        };
+
+        // Ensure audit logs are hash-chained
+        parsed.auditLogs = ensureHashChainedAuditLogs(parsed.auditLogs || INITIAL_AUDIT_LOGS);
+
         return parsed;
       }
     }
@@ -55,6 +108,7 @@ function loadDatabase(): DatabaseSchema {
   }
 
   // Seed default
+  const initialLogs = ensureHashChainedAuditLogs(INITIAL_AUDIT_LOGS);
   const initialData: DatabaseSchema = {
     institutions: INITIAL_INSTITUTIONS,
     users: INITIAL_USERS,
@@ -62,7 +116,7 @@ function loadDatabase(): DatabaseSchema {
     fdrs: INITIAL_FDRS,
     requests: INITIAL_REQUESTS,
     notifications: INITIAL_NOTIFICATIONS,
-    auditLogs: INITIAL_AUDIT_LOGS,
+    auditLogs: initialLogs,
   };
   saveDatabase(initialData);
   return initialData;
@@ -81,13 +135,229 @@ function saveDatabase(data: DatabaseSchema) {
 
 db = loadDatabase();
 
+/**
+ * Appends a tamper-evident hash-chained audit log entry.
+ */
+function logAudit(
+  entry: Omit<AuditLog, 'id' | 'timestamp' | 'prevHash' | 'hash'>,
+  ipAddress: string = '103.224.182.14'
+): AuditLog {
+  const id = `AUD-${Date.now()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+  const timestamp = new Date().toISOString();
+  // Since db.auditLogs is newest first, index 0 contains the latest head hash
+  const prevHash = db.auditLogs.length > 0 && db.auditLogs[0].hash ? db.auditLogs[0].hash : GENESIS_HASH;
+  const hash = computeAuditHash(prevHash, {
+    id,
+    action: entry.action,
+    entityId: entry.entityId,
+    performedBy: entry.performedBy,
+    timestamp,
+    details: entry.details,
+  });
+
+  const fullEntry: AuditLog = {
+    ...entry,
+    id,
+    timestamp,
+    ipAddress,
+    prevHash,
+    hash,
+  };
+
+  db.auditLogs.unshift(fullEntry);
+  return fullEntry;
+}
+
+// ----------------------------------------------------------------------
+// STATE MACHINE TRANSITION SPECIFICATION
+// ----------------------------------------------------------------------
+const VALID_TRANSITIONS: Record<FDRStatus, FDRStatus[]> = {
+  'Submitted': ['Under Review', 'Flagged'],
+  'Under Review': ['Verified', 'Flagged'],
+  'Verified': ['Lien Marked', 'Flagged'],
+  'Lien Marked': ['Active', 'Flagged'],
+  'Active': ['Matured', 'Forfeiture Proposed', 'Flagged'],
+  'Matured': ['Released', 'Forfeiture Proposed', 'Active'],
+  'Flagged': ['Under Review', 'Forfeiture Proposed'],
+  'Forfeiture Proposed': ['Forfeited', 'Active'],
+  'Forfeited': [],
+  'Released': [],
+};
+
+function validateTransition(
+  currentStatus: FDRStatus,
+  targetStatus: FDRStatus,
+  role: string
+): { allowed: boolean; error?: string } {
+  const allowedNext = VALID_TRANSITIONS[currentStatus] || [];
+  if (!allowedNext.includes(targetStatus)) {
+    return {
+      allowed: false,
+      error: `Invalid state transition: Cannot move from "${currentStatus}" to "${targetStatus}". Allowed next states: [${allowedNext.map((s) => `"${s}"`).join(', ')}].`,
+    };
+  }
+
+  if (role === 'institution') {
+    return {
+      allowed: false,
+      error: 'Institutions do not have statutory authority to transition FDR states directly.',
+    };
+  }
+
+  if (targetStatus === 'Forfeited' && role !== 'admin') {
+    return {
+      allowed: false,
+      error: 'Unauthorized: Only AICTE Central Administrators can confirm deposit forfeiture.',
+    };
+  }
+
+  return { allowed: true };
+}
+
+/**
+ * Evaluates proactive alerts for 90/60/30-day maturities, discrepancies, and unverified liens.
+ */
+function evaluateProactiveAlerts(): {
+  alertsGenerated: number;
+  maturityAlerts: number;
+  discrepancyAlerts: number;
+  lienPendingAlerts: number;
+} {
+  let count = 0;
+  let maturityCount = 0;
+  let discrepancyCount = 0;
+  let lienCount = 0;
+
+  const now = new Date();
+
+  for (const fdr of db.fdrs) {
+    if (fdr.status === 'Active' || fdr.status === 'Lien Marked' || fdr.status === 'Verified') {
+      const maturity = new Date(fdr.maturityDate);
+      const diffDays = Math.ceil((maturity.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+
+      // 30 days
+      if (diffDays <= 30 && diffDays > 0) {
+        const notifId = `NOTIF-30D-${fdr.id}`;
+        if (!db.notifications.some((n) => n.id === notifId)) {
+          db.notifications.unshift({
+            id: notifId,
+            recipientRole: 'all',
+            institutionId: fdr.institutionId,
+            title: `CRITICAL: FDR #${fdr.fdrNumber} Matures in ${diffDays} Days`,
+            message: `Deposit of ₹${fdr.amount.toLocaleString('en-IN')} with ${fdr.bankName} matures on ${fdr.maturityDate}. Immediate renewal or statutory release required.`,
+            timestamp: new Date().toISOString(),
+            read: false,
+            type: 'alert',
+            link: fdr.id,
+          });
+          count++;
+          maturityCount++;
+        }
+      } else if (diffDays <= 60 && diffDays > 30) {
+        const notifId = `NOTIF-60D-${fdr.id}`;
+        if (!db.notifications.some((n) => n.id === notifId)) {
+          db.notifications.unshift({
+            id: notifId,
+            recipientRole: 'institution',
+            institutionId: fdr.institutionId,
+            title: `Notice: FDR #${fdr.fdrNumber} Matures in ${diffDays} Days`,
+            message: `Institutional deposit matures on ${fdr.maturityDate}. Prepare tripartite extension mandate.`,
+            timestamp: new Date().toISOString(),
+            read: false,
+            type: 'reminder',
+            link: fdr.id,
+          });
+          count++;
+          maturityCount++;
+        }
+      } else if (diffDays <= 90 && diffDays > 60) {
+        const notifId = `NOTIF-90D-${fdr.id}`;
+        if (!db.notifications.some((n) => n.id === notifId)) {
+          db.notifications.unshift({
+            id: notifId,
+            recipientRole: 'institution',
+            institutionId: fdr.institutionId,
+            title: `Advance Warning: FDR #${fdr.fdrNumber} Matures in ${diffDays} Days`,
+            message: `Deposit matures on ${fdr.maturityDate}. Scrutinize renewal pipeline.`,
+            timestamp: new Date().toISOString(),
+            read: false,
+            type: 'reminder',
+            link: fdr.id,
+          });
+          count++;
+          maturityCount++;
+        }
+      }
+    }
+
+    // Discrepancy Alert
+    if (fdr.mismatches && fdr.mismatches.length > 0 && fdr.status !== 'Forfeited' && fdr.status !== 'Released') {
+      const discId = `NOTIF-DISC-${fdr.id}`;
+      if (!db.notifications.some((n) => n.id === discId)) {
+        db.notifications.unshift({
+          id: discId,
+          recipientRole: 'officer',
+          title: `Discrepancy Detected on ${fdr.trackingId}`,
+          message: `${fdr.institutionName} certificate extracted values mismatch typed lodgement details (${fdr.mismatches.length} items). Scrutiny required.`,
+          timestamp: new Date().toISOString(),
+          read: false,
+          type: 'action_required',
+          link: fdr.id,
+        });
+        count++;
+        discrepancyCount++;
+      }
+    }
+
+    // Unverified Lien older than 7 days
+    if (fdr.lienStatus === 'Pending Lien' || fdr.status === 'Lien Marked') {
+      const subDate = new Date(fdr.submissionDate);
+      const daysOld = (now.getTime() - subDate.getTime()) / (1000 * 60 * 60 * 24);
+      if (daysOld >= 7) {
+        const lienId = `NOTIF-LIEN-DELAY-${fdr.id}`;
+        if (!db.notifications.some((n) => n.id === lienId)) {
+          db.notifications.unshift({
+            id: lienId,
+            recipientRole: 'officer',
+            title: `Bank Lien Pending > 7 Days: ${fdr.trackingId}`,
+            message: `Bank ${fdr.bankName} has not completed tripartite lien confirmation for #${fdr.fdrNumber} (lodged ${Math.floor(daysOld)} days ago).`,
+            timestamp: new Date().toISOString(),
+            read: false,
+            type: 'action_required',
+            link: fdr.id,
+          });
+          count++;
+          lienCount++;
+        }
+      }
+    }
+  }
+
+  if (count > 0) {
+    saveDatabase(db);
+  }
+
+  return { alertsGenerated: count, maturityAlerts: maturityCount, discrepancyAlerts: discrepancyCount, lienPendingAlerts: lienCount };
+}
+
 async function startServer() {
   const app = express();
-  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+  
+  // Dev server must run on port 3000 as required by the environment.
+  // Port 8080 is used by nginx reverse proxy in this container.
+  let PORT = 3000;
+  const portArgIdx = process.argv.indexOf('--port');
+  if (portArgIdx !== -1 && process.argv[portArgIdx + 1]) {
+    PORT = parseInt(process.argv[portArgIdx + 1], 10);
+  } else if (process.env.PORT && process.env.PORT !== '8080') {
+    PORT = parseInt(process.env.PORT, 10);
+  }
 
-  app.use(express.json());
+  // Support up to 15MB base64 uploads for 10MB document files
+  app.use(express.json({ limit: '15mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
-  // Log all API requests
+  // Log API requests
   app.use((req, res, next) => {
     if (req.path.startsWith('/api')) {
       console.log(`[API] ${req.method} ${req.path}`);
@@ -134,21 +404,17 @@ async function startServer() {
         user.lastLogin = new Date().toISOString();
       }
 
-      // Add audit log
-      const auditEntry: AuditLog = {
-        id: `AUD-${Date.now()}`,
+      // Hash-chained audit log
+      logAudit({
         action: 'USER_LOGIN_AADHAAR',
         entityId: user.id,
         entityType: 'USER',
         performedBy: user.name,
         role: user.role,
         details: `Authenticated via Aadhaar OTP (Ref: ${kyc.aadhaarNumber.slice(-4)}). Session active.`,
-        timestamp: new Date().toISOString(),
-        ipAddress: req.ip || '103.224.182.14',
-      };
-      db.auditLogs.unshift(auditEntry);
-      saveDatabase(db);
+      }, req.ip || '103.224.182.14');
 
+      saveDatabase(db);
       res.json({ success: true, user, kyc });
     } catch (err: any) {
       res.status(400).json({ error: err.message || 'OTP verification failed' });
@@ -156,13 +422,165 @@ async function startServer() {
   });
 
   // -------------------------------------------------------------
-  // FDR ROUTES
+  // REAL DOCUMENT EXTRACTION (GEMINI VISION API + SIMULATED FALLBACK)
+  // -------------------------------------------------------------
+  app.post('/api/documents/extract', async (req, res) => {
+    try {
+      const { fileData, fileName, mimeType, typedData } = req.body;
+
+      // Validate file size up to 10 MB
+      if (fileData && typeof fileData === 'string') {
+        const approxBytes = (fileData.length * 3) / 4;
+        if (approxBytes > 10 * 1024 * 1024) {
+          return res.status(400).json({ error: 'File exceeds maximum allowed size of 10 MB.' });
+        }
+      }
+
+      let extracted: any = null;
+      let isSimulated = true;
+
+      // Real Gemini API Call if Key is Present
+      if (process.env.GEMINI_API_KEY) {
+        try {
+          const ai = new GoogleGenAI({
+            apiKey: process.env.GEMINI_API_KEY,
+            httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+          });
+
+          const prompt = `You are an AICTE forensic banking document extraction engine.
+Analyze this Fixed Deposit Receipt / e-FDR deposit certificate and extract all key statutory fields.
+Return a STRICT JSON object where each field contains a "value" and an integer "confidence" score between 0 and 100.
+
+Required JSON Structure:
+{
+  "bankName": { "value": string, "confidence": number },
+  "fdrNumber": { "value": string, "confidence": number },
+  "depositorNames": { "value": string, "confidence": number },
+  "amount": { "value": number, "confidence": number },
+  "issueDate": { "value": "YYYY-MM-DD", "confidence": number },
+  "maturityDate": { "value": "YYYY-MM-DD", "confidence": number },
+  "interestRate": { "value": number, "confidence": number },
+  "lienEndorsementText": { "value": string, "confidence": number }
+}
+
+Notes:
+- depositorNames should list all joint holders (e.g. Institution Name & Member Secretary, AICTE).
+- lienEndorsementText should capture any clause referencing lien/pledge to AICTE.
+- If confidence for a field is uncertain, assign a realistic score below 85.`;
+
+          const contents: any[] = [{ text: prompt }];
+
+          if (fileData && fileData.includes('base64,')) {
+            const [hdr, base64Part] = fileData.split('base64,');
+            const detectedMime = hdr.split(';')[0].replace('data:', '') || mimeType || 'application/pdf';
+            contents.push({
+              inlineData: {
+                mimeType: detectedMime,
+                data: base64Part,
+              },
+            });
+          }
+
+          const response = await ai.models.generateContent({
+            model: 'gemini-3.8-flash',
+            contents,
+            config: {
+              responseMimeType: 'application/json',
+            },
+          });
+
+          if (response.text) {
+            const parsed = JSON.parse(response.text);
+            if (parsed.bankName && (parsed.amount || parsed.fdrNumber)) {
+              extracted = parsed;
+              isSimulated = false;
+            }
+          }
+        } catch (geminiErr: any) {
+          console.warn('[Gemini Vision Extraction Error]:', geminiErr.message || geminiErr);
+          isSimulated = true;
+        }
+      }
+
+      // Graceful Fallback to Simulated Extractor
+      if (!extracted) {
+        const bank = typedData?.bankName || 'State Bank of India';
+        const fdrNum = typedData?.fdrNumber || `SBI-2024-${Math.floor(1000 + Math.random() * 9000)}`;
+        const amount = Number(typedData?.amount) || 1250000;
+        const issue = typedData?.issueDate || new Date().toISOString().split('T')[0];
+        const maturity = typedData?.maturityDate || `${new Date().getFullYear() + 10}-03-15`;
+        const instName = typedData?.institutionName || 'Netaji Engineering College, Kolkata';
+
+        extracted = {
+          bankName: { value: bank, confidence: 96 },
+          fdrNumber: { value: fdrNum, confidence: 94 },
+          depositorNames: { value: `${instName} & Member Secretary, AICTE`, confidence: 88 },
+          amount: { value: amount, confidence: 98 },
+          issueDate: { value: issue, confidence: 92 },
+          maturityDate: { value: maturity, confidence: 90 },
+          interestRate: { value: 7.25, confidence: 88 },
+          lienEndorsementText: {
+            value: 'Irrevocably marked with lien in favour of Member Secretary, AICTE New Delhi as statutory security deposit.',
+            confidence: 82, // Under 85% to demonstrate "Needs human verification"
+          },
+        };
+        isSimulated = true;
+      }
+
+      // Mark fields under 85% confidence as needing human verification
+      for (const key of Object.keys(extracted)) {
+        if (extracted[key] && typeof extracted[key].confidence === 'number') {
+          extracted[key].needsHumanVerification = extracted[key].confidence < 85;
+        }
+      }
+      extracted.isSimulated = isSimulated;
+
+      // Compare extracted values against what the institution typed in the form
+      const mismatches: string[] = [];
+      if (typedData) {
+        if (typedData.amount && Number(typedData.amount) !== Number(extracted.amount?.value)) {
+          mismatches.push(
+            `Amount mismatch: Form typed ₹${Number(typedData.amount).toLocaleString('en-IN')} vs Certificate extracted ₹${Number(extracted.amount?.value).toLocaleString('en-IN')}`
+          );
+        }
+        if (
+          typedData.fdrNumber &&
+          String(typedData.fdrNumber).trim().toUpperCase() !== String(extracted.fdrNumber?.value).trim().toUpperCase()
+        ) {
+          mismatches.push(
+            `FDR Number mismatch: Form typed "${typedData.fdrNumber}" vs Certificate extracted "${extracted.fdrNumber?.value}"`
+          );
+        }
+        if (
+          typedData.bankName &&
+          !String(extracted.bankName?.value).toLowerCase().includes(String(typedData.bankName).toLowerCase())
+        ) {
+          mismatches.push(
+            `Bank mismatch: Form selected "${typedData.bankName}" vs Certificate extracted "${extracted.bankName?.value}"`
+          );
+        }
+      }
+
+      res.json({
+        success: true,
+        extractedData: extracted,
+        mismatches,
+        isSimulated,
+        modeLabel: isSimulated ? 'Demo mode: simulated extraction' : 'Gemini 3.8-Flash Multimodal Vision Extraction',
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Document extraction failed' });
+    }
+  });
+
+  // -------------------------------------------------------------
+  // FDR ROUTES & PUBLIC TRACKING
   // -------------------------------------------------------------
   app.get('/api/fdrs', (req, res) => {
     const { institutionId, role, status, search } = req.query;
     let list = [...db.fdrs];
 
-    // Strict role-based protection: institutions only ever see their own records
+    // Strict role protection: institutions only ever see their own records
     if (role === 'institution' && institutionId) {
       list = list.filter((f) => f.institutionId === institutionId);
     } else if (institutionId) {
@@ -185,27 +603,12 @@ async function startServer() {
       );
     }
 
-    // Always evaluate latest maturity alerts
-    const alerts = NotificationService.evaluateMaturityAlerts(db.fdrs, db.settings);
-    let alertsAdded = false;
-    for (const a of alerts) {
-      if (!db.notifications.some((n) => n.id === a.id)) {
-        db.notifications.unshift(a);
-        alertsAdded = true;
-      }
-    }
-    if (alertsAdded) {
-      saveDatabase(db);
-    }
-
     res.json({ fdrs: list, total: list.length });
   });
 
-  // -------------------------------------------------------------
-  // PUBLIC UNAUTHENTICATED TRACKING ROUTE
-  // -------------------------------------------------------------
+  // Public unauthenticated tracking route
   app.get('/api/public/track', (req, res) => {
-    const rawQuery = (req.query.q as string || '').trim();
+    const rawQuery = ((req.query.q as string) || '').trim();
     if (!rawQuery) {
       return res.status(400).json({
         found: false,
@@ -213,23 +616,24 @@ async function startServer() {
       });
     }
 
-    // Ignore case, spaces and extra dashes, trim whitespace
     const normalize = (str: string) => (str || '').replace(/[\s\-_]/g, '').toLowerCase().trim();
     const queryNorm = normalize(rawQuery);
 
-    // Match by Tracking ID OR bank FDR number (exact normalized first, then substring)
-    const fdr = db.fdrs.find((f) => {
-      const trackingNorm = normalize(f.trackingId);
-      const fdrNumNorm = normalize(f.fdrNumber);
-      return trackingNorm === queryNorm || fdrNumNorm === queryNorm;
-    }) || db.fdrs.find((f) => {
-      const trackingNorm = normalize(f.trackingId);
-      const fdrNumNorm = normalize(f.fdrNumber);
-      return trackingNorm.includes(queryNorm) || fdrNumNorm.includes(queryNorm);
-    }) || db.fdrs.find((f) => {
-      const aicteNorm = normalize(f.aicteId);
-      return aicteNorm === queryNorm;
-    });
+    const fdr =
+      db.fdrs.find((f) => {
+        const trackingNorm = normalize(f.trackingId);
+        const fdrNumNorm = normalize(f.fdrNumber);
+        return trackingNorm === queryNorm || fdrNumNorm === queryNorm;
+      }) ||
+      db.fdrs.find((f) => {
+        const trackingNorm = normalize(f.trackingId);
+        const fdrNumNorm = normalize(f.fdrNumber);
+        return trackingNorm.includes(queryNorm) || fdrNumNorm.includes(queryNorm);
+      }) ||
+      db.fdrs.find((f) => {
+        const aicteNorm = normalize(f.aicteId);
+        return aicteNorm === queryNorm;
+      });
 
     if (!fdr) {
       return res.status(404).json({
@@ -238,13 +642,11 @@ async function startServer() {
       });
     }
 
-    // Mask bank FDR number for public display (e.g. PNB-••••-4428 or •••• •••• 8291)
     const rawNum = (fdr.fdrNumber || '').trim();
     const last4 = rawNum.slice(-4);
     const prefix = rawNum.includes('-') ? rawNum.split('-')[0] + '-••••-' : '•••• •••• ';
     const maskedFdrNumber = `${prefix}${last4}`;
 
-    // Return sanitized public result (no internal documents, remarks, or personal details)
     res.json({
       found: true,
       fdr: {
@@ -286,10 +688,12 @@ async function startServer() {
       return res.status(404).json({ error: `FDR record not found for reference "${req.params.id}"` });
     }
 
-    // Role protection on detail route
     if (role === 'institution' && institutionId && fdr.institutionId !== institutionId) {
       return res.status(403).json({ error: 'Access Denied: You cannot view records of another institution.' });
     }
+
+    // Always evaluate latest rule results
+    fdr.ruleResults = RulesEngine.evaluate(fdr, db.fdrs, db.settings).rules;
 
     const relatedAudit = db.auditLogs.filter(
       (a) =>
@@ -305,7 +709,6 @@ async function startServer() {
     try {
       const body = req.body;
 
-      // Validation
       const amount = Number(body.amount);
       if (isNaN(amount) || amount <= 0) {
         return res.status(400).json({ error: 'Security deposit amount must be a positive number' });
@@ -321,7 +724,6 @@ async function startServer() {
         return res.status(400).json({ error: 'Maturity date must be strictly after the issue date' });
       }
 
-      // Compute next unique sequential tracking ID: FDR-YYYY-XXXXXX
       let maxSeq = 125;
       for (const item of db.fdrs) {
         const match = item.trackingId.match(/FDR-\d{4}-(\d+)/);
@@ -335,17 +737,13 @@ async function startServer() {
       const trackingId = `FDR-${currentYear}-${String(nextSeq).padStart(6, '0')}`;
       const fdrId = `FDR-${Date.now()}`;
 
-      // Check last digit of fdrNumber for initial bank match preview
-      const digits = (body.fdrNumber || '').replace(/\D/g, '');
-      const lastDigit = digits.length > 0 ? parseInt(digits.slice(-1), 10) : 0;
-      const isEven = lastDigit % 2 === 0;
-
       const newFDR: FDR = {
         id: fdrId,
         trackingId,
         institutionId: body.institutionId || 'INST-001',
         institutionName: body.institutionName || 'Netaji Engineering College, Kolkata',
         aicteId: body.aicteId || '1-932148291',
+        category: body.category || 'Engineering & Technology',
         bankName: body.bankName,
         branchName: body.branchName,
         ifscCode: body.ifscCode || 'SBIN0000001',
@@ -358,11 +756,17 @@ async function startServer() {
         status: 'Submitted',
         lienStatus: 'Pending Lien',
         lienId: 'LN-UNASSIGNED',
-        autoVerificationStatus: isEven ? 'matched' : 'pending',
-        aiCheckStatus: isEven ? 'passed' : 'warning',
-        aiCheckNotes: isEven 
-          ? ['DigiLocker certificate verified', 'Tripartite clause detected'] 
-          : ['Needs review of joint endorsement clause'],
+        jointHolding: body.jointHolding !== undefined ? body.jointHolding : true,
+        jointHolderName: body.jointHolderName || 'Member Secretary, AICTE',
+        lienEndorsementText: body.lienEndorsementText || 'Pledged to Member Secretary, AICTE as statutory security deposit',
+        bankLienVerified: false,
+        extractedData: body.extractedData,
+        mismatches: body.mismatches || [],
+        autoVerificationStatus: body.mismatches && body.mismatches.length > 0 ? 'mismatched' : 'pending',
+        aiCheckStatus: body.mismatches && body.mismatches.length > 0 ? 'warning' : 'passed',
+        aiCheckNotes: body.mismatches && body.mismatches.length > 0
+          ? body.mismatches
+          : ['Document verified via e-FDR extractor', 'Joint holding clause verified'],
         submissionDate: new Date().toISOString(),
         remarksHistory: [
           {
@@ -387,22 +791,23 @@ async function startServer() {
         ],
       };
 
+      // Evaluate rules
+      const ruleEval = RulesEngine.evaluate(newFDR, db.fdrs, db.settings);
+      newFDR.ruleResults = ruleEval.rules;
+
       db.fdrs.unshift(newFDR);
 
-      // Audit Log
-      db.auditLogs.unshift({
-        id: `AUD-${Date.now()}`,
+      // Hash-chained audit log
+      logAudit({
         action: 'FDR_SUBMITTED',
         entityId: fdrId,
         entityType: 'FDR',
         performedBy: body.submittedBy || 'Authorized Signatory',
         role: 'institution',
-        details: `Lodged new FDR ${trackingId} (#${body.fdrNumber}) for ₹${newFDR.amount.toLocaleString('en-IN')} with ${body.bankName}.`,
-        timestamp: new Date().toISOString(),
-        ipAddress: req.ip || '103.224.182.14',
-      });
+        details: `Lodged new FDR ${trackingId} (#${body.fdrNumber}) for ₹${newFDR.amount.toLocaleString('en-IN')} with ${body.bankName}. Category: ${newFDR.category}.`,
+      }, req.ip || '103.224.182.14');
 
-      // Notification for Officers
+      // Notification
       db.notifications.unshift({
         id: `NOTIF-${Date.now()}`,
         recipientRole: 'officer',
@@ -421,10 +826,102 @@ async function startServer() {
     }
   });
 
-  // Officer reviews FDR (Approve / Reject / Request More Info)
+  // -------------------------------------------------------------
+  // OFFICER & ADMIN SCRUTINY / STATE MACHINE ENFORCEMENT
+  // -------------------------------------------------------------
+  app.post('/api/fdrs/:id/transition', (req, res) => {
+    try {
+      const { targetStatus, remarks, officerName, role = 'officer', overrideReason } = req.body;
+      const fdr = db.fdrs.find((f) => f.id === req.params.id);
+
+      if (!fdr) {
+        return res.status(404).json({ error: 'FDR record not found' });
+      }
+
+      // Check transition authorization
+      const transitionCheck = validateTransition(fdr.status, targetStatus, role);
+      if (!transitionCheck.allowed) {
+        return res.status(400).json({ error: transitionCheck.error });
+      }
+
+      // Rule Engine Check when moving to 'Verified'
+      if (targetStatus === 'Verified') {
+        const ruleEval = RulesEngine.evaluate(fdr, db.fdrs, db.settings);
+        fdr.ruleResults = ruleEval.rules;
+        if (ruleEval.criticalFailed && (!overrideReason || overrideReason.trim().length === 0)) {
+          const failedRules = ruleEval.rules.filter((r) => r.critical && !r.passed).map((r) => r.name);
+          return res.status(400).json({
+            error: `Approval blocked: Critical statutory rule checks failed (${failedRules.join(', ')}). A recorded Scrutiny Override Reason is required to proceed.`,
+            failedRules,
+          });
+        }
+        if (overrideReason) {
+          fdr.overrideReason = overrideReason;
+        }
+      }
+
+      // Check bank lien verification when moving to 'Active'
+      if (targetStatus === 'Active' && fdr.status === 'Lien Marked') {
+        fdr.bankLienVerified = true;
+        fdr.lienStatus = 'Active Lien';
+      }
+
+      const timestamp = new Date().toISOString();
+      const prevStatus = fdr.status;
+      fdr.status = targetStatus;
+
+      if (targetStatus === 'Verified') {
+        fdr.verifiedAt = timestamp;
+        fdr.verifiedBy = officerName || 'AICTE Officer';
+      } else if (targetStatus === 'Lien Marked') {
+        if (fdr.lienId === 'LN-UNASSIGNED' || !fdr.lienId) {
+          fdr.lienId = `LN-${Math.floor(10000 + Math.random() * 90000)}`;
+        }
+      }
+
+      fdr.remarksHistory.push({
+        id: `REM-${Date.now()}`,
+        author: officerName || 'AICTE Scrutiny Officer',
+        role,
+        note: remarks || `Status changed from ${prevStatus} to ${targetStatus}`,
+        timestamp,
+        statusChangedTo: targetStatus,
+      });
+
+      // Audit log
+      logAudit({
+        action: `STATE_CHANGE_${targetStatus.toUpperCase().replace(/\s+/g, '_')}`,
+        entityId: fdr.id,
+        entityType: 'FDR',
+        performedBy: officerName || 'AICTE Officer',
+        role,
+        details: `State transitioned from ${prevStatus} to ${targetStatus} for ${fdr.trackingId}. ${overrideReason ? `[Override Reason: ${overrideReason}]` : ''} Note: "${remarks || 'Statutory review action'}"`,
+      }, req.ip || '10.14.89.21');
+
+      // Notification
+      db.notifications.unshift({
+        id: `NOTIF-${Date.now()}`,
+        recipientRole: 'institution',
+        institutionId: fdr.institutionId,
+        title: `FDR ${fdr.trackingId}: ${targetStatus}`,
+        message: `Status updated to ${targetStatus}. Remark: "${remarks || 'Action completed per statutory protocol'}"`,
+        timestamp,
+        read: false,
+        type: 'status_change',
+        link: fdr.id,
+      });
+
+      saveDatabase(db);
+      res.json({ success: true, fdr });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message || 'Transition failed' });
+    }
+  });
+
+  // Legacy review action route - mapped through rule checks and state machine
   app.post('/api/fdrs/:id/review', (req, res) => {
     try {
-      const { action, remarks, officerName } = req.body;
+      const { action, remarks, officerName, overrideReason } = req.body;
       const fdr = db.fdrs.find((f) => f.id === req.params.id);
 
       if (!fdr) {
@@ -436,31 +933,53 @@ async function startServer() {
       }
 
       const timestamp = new Date().toISOString();
-      let newStatus: FDR['status'] = fdr.status;
-      let newLienStatus = fdr.lienStatus;
-      let newLienId = fdr.lienId;
+      let targetStatus: FDRStatus = fdr.status;
 
       if (action === 'approve') {
-        newStatus = 'Active';
-        newLienStatus = 'Active Lien';
-        if (newLienId === 'LN-UNASSIGNED' || newLienId.includes('PENDING')) {
-          newLienId = `LN-${Math.floor(10000 + Math.random() * 90000)}`;
+        // Run rule engine
+        const ruleEval = RulesEngine.evaluate(fdr, db.fdrs, db.settings);
+        fdr.ruleResults = ruleEval.rules;
+        if (ruleEval.criticalFailed && (!overrideReason || overrideReason.trim().length === 0)) {
+          const failedRules = ruleEval.rules.filter((r) => r.critical && !r.passed).map((r) => r.name);
+          return res.status(400).json({
+            error: `Approval blocked: Critical statutory rules failed (${failedRules.join(', ')}). A recorded Scrutiny Override Reason is required to proceed.`,
+            failedRules,
+          });
+        }
+        if (overrideReason) {
+          fdr.overrideReason = overrideReason;
+        }
+
+        targetStatus = 'Active';
+        fdr.lienStatus = 'Active Lien';
+        fdr.bankLienVerified = true;
+        if (fdr.lienId === 'LN-UNASSIGNED' || !fdr.lienId) {
+          fdr.lienId = `LN-${Math.floor(10000 + Math.random() * 90000)}`;
         }
         fdr.verifiedAt = timestamp;
         fdr.verifiedBy = officerName || 'AICTE Scrutiny Officer';
         fdr.autoVerificationStatus = 'matched';
       } else if (action === 'reject') {
-        newStatus = 'Flagged';
+        targetStatus = 'Flagged';
         fdr.autoVerificationStatus = 'mismatched';
       } else if (action === 'request_info') {
-        newStatus = 'Under Review';
+        targetStatus = 'Under Review';
       } else if (action === 'verify') {
-        newStatus = 'Verified';
+        const ruleEval = RulesEngine.evaluate(fdr, db.fdrs, db.settings);
+        fdr.ruleResults = ruleEval.rules;
+        if (ruleEval.criticalFailed && (!overrideReason || overrideReason.trim().length === 0)) {
+          const failedRules = ruleEval.rules.filter((r) => r.critical && !r.passed).map((r) => r.name);
+          return res.status(400).json({
+            error: `Verification blocked: Critical rules failed (${failedRules.join(', ')}). Scrutiny Override Reason is required.`,
+            failedRules,
+          });
+        }
+        targetStatus = 'Verified';
+        fdr.verifiedAt = timestamp;
+        fdr.verifiedBy = officerName || 'AICTE Officer';
       }
 
-      fdr.status = newStatus;
-      fdr.lienStatus = newLienStatus;
-      fdr.lienId = newLienId;
+      fdr.status = targetStatus;
 
       fdr.remarksHistory.push({
         id: `REM-${Date.now()}`,
@@ -468,29 +987,26 @@ async function startServer() {
         role: 'officer',
         note: remarks,
         timestamp,
-        statusChangedTo: newStatus,
+        statusChangedTo: targetStatus,
       });
 
       // Audit Log
-      db.auditLogs.unshift({
-        id: `AUD-${Date.now()}`,
+      logAudit({
         action: `FDR_${action.toUpperCase()}`,
         entityId: fdr.id,
         entityType: 'FDR',
         performedBy: officerName || 'AICTE Officer',
         role: 'officer',
-        details: `Scrutiny action '${action}' applied to ${fdr.trackingId}. Status updated to ${newStatus}. Remarks: "${remarks}".`,
-        timestamp,
-        ipAddress: req.ip || '10.14.89.21',
-      });
+        details: `Scrutiny action '${action}' applied to ${fdr.trackingId}. Status updated to ${targetStatus}. ${overrideReason ? `[Override: ${overrideReason}]` : ''} Remarks: "${remarks}".`,
+      }, req.ip || '10.14.89.21');
 
-      // Notify Institution
+      // Notification
       db.notifications.unshift({
         id: `NOTIF-${Date.now()}`,
         recipientRole: 'institution',
         institutionId: fdr.institutionId,
-        title: `FDR ${fdr.trackingId}: ${newStatus.toUpperCase()}`,
-        message: `AICTE Scrutiny Officer updated status to ${newStatus}. Remark: "${remarks}"`,
+        title: `FDR ${fdr.trackingId}: ${targetStatus.toUpperCase()}`,
+        message: `AICTE Scrutiny Officer updated status to ${targetStatus}. Remark: "${remarks}"`,
         timestamp,
         read: false,
         type: action === 'approve' ? 'status_change' : action === 'reject' ? 'alert' : 'action_required',
@@ -504,7 +1020,472 @@ async function startServer() {
     }
   });
 
-  // Institution files Renewal or Release Request
+  // -------------------------------------------------------------
+  // INLINE OFFICER FIELD CONFIRMATION
+  // -------------------------------------------------------------
+  app.put('/api/fdrs/:id/confirm-fields', (req, res) => {
+    try {
+      const { confirmedFields, officerName } = req.body;
+      const fdr = db.fdrs.find((f) => f.id === req.params.id);
+
+      if (!fdr) {
+        return res.status(404).json({ error: 'FDR record not found' });
+      }
+
+      fdr.officerConfirmedData = {
+        ...(fdr.officerConfirmedData || {}),
+        ...confirmedFields,
+      };
+
+      // If key fields confirmed, update FDR core data
+      if (confirmedFields.amount) fdr.amount = Number(confirmedFields.amount);
+      if (confirmedFields.bankName) fdr.bankName = String(confirmedFields.bankName);
+      if (confirmedFields.fdrNumber) fdr.fdrNumber = String(confirmedFields.fdrNumber);
+      if (confirmedFields.maturityDate) fdr.maturityDate = String(confirmedFields.maturityDate);
+      if (confirmedFields.depositorNames) fdr.jointHolderName = String(confirmedFields.depositorNames);
+
+      // Re-evaluate rules
+      fdr.ruleResults = RulesEngine.evaluate(fdr, db.fdrs, db.settings).rules;
+
+      // Audit Log with both extracted & confirmed values
+      const details = `Officer confirmed document fields for ${fdr.trackingId}. Confirmed: ${JSON.stringify(confirmedFields)}. Extracted reference: ${JSON.stringify(fdr.extractedData || {})}`;
+      logAudit({
+        action: 'OFFICER_FIELD_CONFIRMATION',
+        entityId: fdr.id,
+        entityType: 'FDR',
+        performedBy: officerName || 'AICTE Officer',
+        role: 'officer',
+        details,
+      }, req.ip || '10.14.89.21');
+
+      saveDatabase(db);
+      res.json({ success: true, fdr });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message || 'Field confirmation failed' });
+    }
+  });
+
+  // -------------------------------------------------------------
+  // TWO-STEP FORFEITURE WORKFLOW
+  // -------------------------------------------------------------
+  app.post('/api/fdrs/:id/propose-forfeiture', (req, res) => {
+    try {
+      const { reason, showCauseRef, officerNote, officerName } = req.body;
+      const fdr = db.fdrs.find((f) => f.id === req.params.id);
+
+      if (!fdr) {
+        return res.status(404).json({ error: 'FDR record not found' });
+      }
+
+      if (!reason || !showCauseRef) {
+        return res.status(400).json({ error: 'Forfeiture reason and Show-Cause notice reference are required.' });
+      }
+
+      const timestamp = new Date().toISOString();
+      fdr.status = 'Forfeiture Proposed';
+      fdr.forfeitureDetails = {
+        reason,
+        showCauseRef,
+        proposedBy: officerName || 'AICTE Officer',
+        proposedAt: timestamp,
+        officerNote: officerNote || '',
+      };
+
+      fdr.remarksHistory.push({
+        id: `REM-${Date.now()}`,
+        author: officerName || 'AICTE Officer',
+        role: 'officer',
+        note: `FORFEITURE PROPOSED. Reason: ${reason}. Show-Cause Ref: ${showCauseRef}. ${officerNote || ''}`,
+        timestamp,
+        statusChangedTo: 'Forfeiture Proposed',
+      });
+
+      // Audit log
+      logAudit({
+        action: 'FORFEITURE_PROPOSED',
+        entityId: fdr.id,
+        entityType: 'FDR',
+        performedBy: officerName || 'AICTE Officer',
+        role: 'officer',
+        details: `Forfeiture proposed for ${fdr.trackingId} (#${fdr.fdrNumber}). Reason: "${reason}". Show-Cause Notice: ${showCauseRef}.`,
+      }, req.ip || '10.14.89.21');
+
+      // Urgent Notifications
+      db.notifications.unshift({
+        id: `NOTIF-FORFEIT-INST-${Date.now()}`,
+        recipientRole: 'institution',
+        institutionId: fdr.institutionId,
+        title: `URGENT: Show-Cause Notice for Deposit Forfeiture (${fdr.trackingId})`,
+        message: `AICTE has proposed forfeiture of deposit #${fdr.fdrNumber} (₹${fdr.amount.toLocaleString('en-IN')}) citing "${reason}". Review notice and file institutional response.`,
+        timestamp,
+        read: false,
+        type: 'alert',
+        link: fdr.id,
+      });
+
+      db.notifications.unshift({
+        id: `NOTIF-FORFEIT-ADM-${Date.now()}`,
+        recipientRole: 'admin',
+        title: `Forfeiture Approval Needed: ${fdr.trackingId}`,
+        message: `${officerName || 'Officer'} proposed forfeiture for ${fdr.institutionName} (₹${fdr.amount.toLocaleString('en-IN')}). Show-Cause: ${showCauseRef}.`,
+        timestamp,
+        read: false,
+        type: 'action_required',
+        link: fdr.id,
+      });
+
+      saveDatabase(db);
+      res.json({ success: true, fdr });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message || 'Failed to propose forfeiture' });
+    }
+  });
+
+  app.post('/api/fdrs/:id/approve-forfeiture', (req, res) => {
+    try {
+      const { adminName, approvalNote } = req.body;
+      const fdr = db.fdrs.find((f) => f.id === req.params.id);
+
+      if (!fdr) {
+        return res.status(404).json({ error: 'FDR record not found' });
+      }
+
+      if (fdr.status !== 'Forfeiture Proposed') {
+        return res.status(400).json({ error: 'Cannot approve forfeiture: Deposit must be in "Forfeiture Proposed" status.' });
+      }
+
+      const timestamp = new Date().toISOString();
+      fdr.status = 'Forfeited';
+      fdr.lienStatus = 'Active Lien'; // Funds seized to AICTE central account
+      if (fdr.forfeitureDetails) {
+        fdr.forfeitureDetails.approvedBy = adminName || 'AICTE Central Administrator';
+        fdr.forfeitureDetails.approvedAt = timestamp;
+      }
+
+      fdr.remarksHistory.push({
+        id: `REM-${Date.now()}`,
+        author: adminName || 'AICTE Admin',
+        role: 'admin',
+        note: `DEPOSIT FORFEITURE CONFIRMED. Funds seized under AICTE statutory mandate. ${approvalNote || ''}`,
+        timestamp,
+        statusChangedTo: 'Forfeited',
+      });
+
+      // Audit Log
+      logAudit({
+        action: 'FORFEITURE_CONFIRMED',
+        entityId: fdr.id,
+        entityType: 'FDR',
+        performedBy: adminName || 'AICTE Admin',
+        role: 'admin',
+        details: `Deposit ${fdr.trackingId} (#${fdr.fdrNumber}) FORFEITED to AICTE. Amount: ₹${fdr.amount.toLocaleString('en-IN')}. Note: "${approvalNote || 'Administrative sanction granted.'}"`,
+      }, req.ip || '10.14.1.10');
+
+      // Notification
+      db.notifications.unshift({
+        id: `NOTIF-FORFEITED-${Date.now()}`,
+        recipientRole: 'institution',
+        institutionId: fdr.institutionId,
+        title: `FINAL NOTICE: Security Deposit Forfeited (${fdr.trackingId})`,
+        message: `Security deposit #${fdr.fdrNumber} (₹${fdr.amount.toLocaleString('en-IN')}) has been forfeited to AICTE.`,
+        timestamp,
+        read: false,
+        type: 'alert',
+        link: fdr.id,
+      });
+
+      saveDatabase(db);
+      res.json({ success: true, fdr });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message || 'Failed to approve forfeiture' });
+    }
+  });
+
+  app.post('/api/fdrs/:id/reject-forfeiture', (req, res) => {
+    try {
+      const { adminName, rejectionReason } = req.body;
+      const fdr = db.fdrs.find((f) => f.id === req.params.id);
+
+      if (!fdr) {
+        return res.status(404).json({ error: 'FDR not found' });
+      }
+
+      const timestamp = new Date().toISOString();
+      fdr.status = 'Active';
+      if (fdr.forfeitureDetails) {
+        fdr.forfeitureDetails.rejectedBy = adminName || 'AICTE Admin';
+        fdr.forfeitureDetails.rejectedAt = timestamp;
+      }
+
+      fdr.remarksHistory.push({
+        id: `REM-${Date.now()}`,
+        author: adminName || 'AICTE Admin',
+        role: 'admin',
+        note: `Forfeiture proposal rejected. Reinstated to Active status. Reason: ${rejectionReason || 'Satisfactory institutional reply'}`,
+        timestamp,
+        statusChangedTo: 'Active',
+      });
+
+      logAudit({
+        action: 'FORFEITURE_REJECTED',
+        entityId: fdr.id,
+        entityType: 'FDR',
+        performedBy: adminName || 'AICTE Admin',
+        role: 'admin',
+        details: `Forfeiture rejected for ${fdr.trackingId}. Reinstated to Active status. Reason: "${rejectionReason || 'Satisfactory compliance'}".`,
+      }, req.ip || '10.14.1.10');
+
+      saveDatabase(db);
+      res.json({ success: true, fdr });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message || 'Failed to reject forfeiture' });
+    }
+  });
+
+  app.post('/api/fdrs/:id/institution-response', (req, res) => {
+    try {
+      const { responseText, submittedBy } = req.body;
+      const fdr = db.fdrs.find((f) => f.id === req.params.id);
+
+      if (!fdr) {
+        return res.status(404).json({ error: 'FDR not found' });
+      }
+
+      if (!responseText || responseText.trim().length === 0) {
+        return res.status(400).json({ error: 'Institutional response text is required' });
+      }
+
+      const timestamp = new Date().toISOString();
+      if (!fdr.forfeitureDetails) {
+        fdr.forfeitureDetails = {
+          reason: 'Show cause response',
+          showCauseRef: 'IN-LINE',
+          proposedBy: 'System',
+          proposedAt: timestamp,
+        };
+      }
+
+      fdr.forfeitureDetails.institutionResponse = responseText;
+      fdr.forfeitureDetails.institutionRespondedAt = timestamp;
+
+      fdr.remarksHistory.push({
+        id: `REM-${Date.now()}`,
+        author: submittedBy || 'Authorized Signatory',
+        role: 'institution',
+        note: `Institutional Compliance Response Submitted: "${responseText}"`,
+        timestamp,
+      });
+
+      logAudit({
+        action: 'FORFEITURE_RESPONSE_SUBMITTED',
+        entityId: fdr.id,
+        entityType: 'FDR',
+        performedBy: submittedBy || 'Authorized Signatory',
+        role: 'institution',
+        details: `Submitted formal reply to forfeiture show-cause for ${fdr.trackingId}: "${responseText.substring(0, 100)}..."`,
+      }, req.ip || '103.224.182.14');
+
+      db.notifications.unshift({
+        id: `NOTIF-${Date.now()}`,
+        recipientRole: 'officer',
+        title: `Institutional Response Received: ${fdr.trackingId}`,
+        message: `${fdr.institutionName} submitted written response to forfeiture notice for FDR #${fdr.fdrNumber}.`,
+        timestamp,
+        read: false,
+        type: 'action_required',
+        link: fdr.id,
+      });
+
+      saveDatabase(db);
+      res.json({ success: true, fdr });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message || 'Failed to submit response' });
+    }
+  });
+
+  // -------------------------------------------------------------
+  // MULTI-SIGNATURE RELEASE FLOW
+  // -------------------------------------------------------------
+  app.post('/api/fdrs/:id/recommend-release', (req, res) => {
+    try {
+      const { officerName, recommendationNote } = req.body;
+      const fdr = db.fdrs.find((f) => f.id === req.params.id);
+
+      if (!fdr) {
+        return res.status(404).json({ error: 'FDR not found' });
+      }
+
+      const timestamp = new Date().toISOString();
+      fdr.releaseRecommendation = {
+        recommendedBy: officerName || 'AICTE Officer',
+        recommendedAt: timestamp,
+        recommendationNote: recommendationNote || 'All statutory conditions verified. Release recommended.',
+      };
+
+      fdr.remarksHistory.push({
+        id: `REM-${Date.now()}`,
+        author: officerName || 'AICTE Officer',
+        role: 'officer',
+        note: `Release recommended: "${recommendationNote || 'Statutory period completed'}". Awaiting Admin counter-signature.`,
+        timestamp,
+      });
+
+      logAudit({
+        action: 'RELEASE_RECOMMENDED',
+        entityId: fdr.id,
+        entityType: 'FDR',
+        performedBy: officerName || 'AICTE Officer',
+        role: 'officer',
+        details: `Release recommended for ${fdr.trackingId}. Note: "${recommendationNote || 'Conditions satisfied'}"`,
+      }, req.ip || '10.14.89.21');
+
+      db.notifications.unshift({
+        id: `NOTIF-REL-COUNTER-${Date.now()}`,
+        recipientRole: 'admin',
+        title: `Counter-Signature Required: Release of ${fdr.trackingId}`,
+        message: `${officerName || 'Officer'} recommended deposit release for ${fdr.institutionName} (₹${fdr.amount.toLocaleString('en-IN')}). Counter-signature required to execute bank lien revocation.`,
+        timestamp,
+        read: false,
+        type: 'action_required',
+        link: fdr.id,
+      });
+
+      saveDatabase(db);
+      res.json({ success: true, fdr });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message || 'Failed to recommend release' });
+    }
+  });
+
+  app.post('/api/fdrs/:id/countersign-release', (req, res) => {
+    try {
+      const { adminName, countersignNote } = req.body;
+      const fdr = db.fdrs.find((f) => f.id === req.params.id);
+
+      if (!fdr) {
+        return res.status(404).json({ error: 'FDR not found' });
+      }
+
+      const timestamp = new Date().toISOString();
+      fdr.status = 'Released';
+      fdr.lienStatus = 'Released Lien';
+
+      if (!fdr.releaseRecommendation) {
+        fdr.releaseRecommendation = {
+          recommendedBy: 'AICTE Scrutiny Officer',
+          recommendedAt: timestamp,
+        };
+      }
+      fdr.releaseRecommendation.counterSignedBy = adminName || 'AICTE Central Admin';
+      fdr.releaseRecommendation.counterSignedAt = timestamp;
+
+      fdr.remarksHistory.push({
+        id: `REM-${Date.now()}`,
+        author: adminName || 'AICTE Admin',
+        role: 'admin',
+        note: `FINAL LIEN RELEASE COUNTER-SIGNED. Bank mandate issued. Note: ${countersignNote || 'Approved'}`,
+        timestamp,
+        statusChangedTo: 'Released',
+      });
+
+      logAudit({
+        action: 'RELEASE_COUNTERSIGNED',
+        entityId: fdr.id,
+        entityType: 'FDR',
+        performedBy: adminName || 'AICTE Admin',
+        role: 'admin',
+        details: `Final lien release counter-signed for ${fdr.trackingId} (#${fdr.fdrNumber}). Lien released.`,
+      }, req.ip || '10.14.1.10');
+
+      db.notifications.unshift({
+        id: `NOTIF-${Date.now()}`,
+        recipientRole: 'institution',
+        institutionId: fdr.institutionId,
+        title: `Lien Released: ${fdr.trackingId}`,
+        message: `AICTE has executed the final release for FDR #${fdr.fdrNumber}. Tripartite lien revoked with ${fdr.bankName}.`,
+        timestamp,
+        read: false,
+        type: 'status_change',
+        link: fdr.id,
+      });
+
+      saveDatabase(db);
+      res.json({ success: true, fdr });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message || 'Counter-signature failed' });
+    }
+  });
+
+  // -------------------------------------------------------------
+  // TAMPER-EVIDENT HASH-CHAINED AUDIT VERIFICATION
+  // -------------------------------------------------------------
+  app.get('/api/audit/verify-integrity', (req, res) => {
+    try {
+      // Re-verify the hash chain from oldest to newest
+      const chronological = [...db.auditLogs].sort(
+        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      );
+
+      let runningPrevHash = GENESIS_HASH;
+      for (let i = 0; i < chronological.length; i++) {
+        const item = chronological[i];
+        if (item.prevHash !== runningPrevHash) {
+          return res.json({
+            valid: false,
+            brokenAtIndex: i,
+            brokenAtId: item.id,
+            reason: `Broken chain: Previous hash mismatch at record ${item.id}`,
+            expectedPrevHash: runningPrevHash,
+            actualPrevHash: item.prevHash,
+          });
+        }
+
+        const expectedHash = computeAuditHash(runningPrevHash, item);
+        if (item.hash !== expectedHash) {
+          return res.json({
+            valid: false,
+            brokenAtIndex: i,
+            brokenAtId: item.id,
+            reason: `Data tampering detected: SHA-256 digest mismatch at record ${item.id}`,
+            expectedHash,
+            actualHash: item.hash,
+          });
+        }
+
+        runningPrevHash = item.hash;
+      }
+
+      res.json({
+        valid: true,
+        totalChecked: chronological.length,
+        headHash: db.auditLogs.length > 0 ? db.auditLogs[0].hash : GENESIS_HASH,
+        genesisHash: GENESIS_HASH,
+        verifiedAt: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Integrity verification failed' });
+    }
+  });
+
+  // -------------------------------------------------------------
+  // PROACTIVE ALERT ENGINE RUN-NOW TRIGGER
+  // -------------------------------------------------------------
+  app.post('/api/alerts/run-now', (req, res) => {
+    try {
+      const summary = evaluateProactiveAlerts();
+      res.json({
+        success: true,
+        summary,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to run alert engine' });
+    }
+  });
+
+  // -------------------------------------------------------------
+  // RENEWAL & RELEASE REQUESTS
+  // -------------------------------------------------------------
   app.post('/api/fdrs/:id/request', (req, res) => {
     try {
       const { type, reason, requestedBy } = req.body;
@@ -533,20 +1514,15 @@ async function startServer() {
 
       db.requests.unshift(newRequest);
 
-      // Audit Log
-      db.auditLogs.unshift({
-        id: `AUD-${Date.now()}`,
+      logAudit({
         action: `REQUEST_${type.toUpperCase()}_FILED`,
         entityId: fdr.id,
         entityType: 'REQUEST',
         performedBy: requestedBy || 'Authorized Institution Officer',
         role: 'institution',
         details: `Filed ${type.toUpperCase()} request for ${fdr.trackingId} (#${fdr.fdrNumber}). Reason: "${reason}".`,
-        timestamp: new Date().toISOString(),
-        ipAddress: req.ip || '103.224.182.14',
-      });
+      }, req.ip || '103.224.182.14');
 
-      // Officer notification
       db.notifications.unshift({
         id: `NOTIF-${Date.now()}`,
         recipientRole: 'officer',
@@ -565,7 +1541,6 @@ async function startServer() {
     }
   });
 
-  // Officer / Admin acts on Renewal or Release request
   app.post('/api/requests/:id/action', (req, res) => {
     try {
       const { action, officerRemarks, officerName } = req.body;
@@ -595,20 +1570,8 @@ async function startServer() {
             timestamp,
             statusChangedTo: 'Released',
           });
-          db.auditLogs.unshift({
-            id: `AUD-${Date.now()}-REL`,
-            action: 'FDR_RELEASED',
-            entityId: fdr.id,
-            entityType: 'FDR',
-            performedBy: officerName || 'AICTE Officer',
-            role: 'officer',
-            details: `FDR ${fdr.trackingId} (#${fdr.fdrNumber}) released following statutory approval of ${request.id}.`,
-            timestamp,
-            ipAddress: req.ip || '10.14.89.21',
-          });
         } else if (request.type === 'renewal') {
           fdr.status = 'Active';
-          // Extend maturity date by 5 years
           const oldMaturity = new Date(fdr.maturityDate);
           oldMaturity.setFullYear(oldMaturity.getFullYear() + 5);
           fdr.maturityDate = oldMaturity.toISOString().split('T')[0];
@@ -620,34 +1583,18 @@ async function startServer() {
             timestamp,
             statusChangedTo: 'Active',
           });
-          db.auditLogs.unshift({
-            id: `AUD-${Date.now()}-REN`,
-            action: 'FDR_RENEWED',
-            entityId: fdr.id,
-            entityType: 'FDR',
-            performedBy: officerName || 'AICTE Officer',
-            role: 'officer',
-            details: `FDR ${fdr.trackingId} renewed for 5 years to ${fdr.maturityDate}.`,
-            timestamp,
-            ipAddress: req.ip || '10.14.89.21',
-          });
         }
       }
 
-      // Audit
-      db.auditLogs.unshift({
-        id: `AUD-${Date.now()}`,
+      logAudit({
         action: `REQUEST_${request.type.toUpperCase()}_${action.toUpperCase()}`,
         entityId: request.id,
         entityType: 'REQUEST',
         performedBy: officerName || 'AICTE Officer',
         role: 'officer',
         details: `${request.type.toUpperCase()} request for ${request.trackingId} was ${action.toUpperCase()}. Remark: "${officerRemarks}".`,
-        timestamp,
-        ipAddress: req.ip || '10.14.89.21',
-      });
+      }, req.ip || '10.14.89.21');
 
-      // Notification to institution
       db.notifications.unshift({
         id: `NOTIF-${Date.now()}`,
         recipientRole: 'institution',
@@ -716,8 +1663,6 @@ async function startServer() {
       list = list.filter((n) => n.recipientRole === 'all' || (n.recipientRole === 'institution' && n.institutionId === institutionId));
     } else if (role === 'officer') {
       list = list.filter((n) => n.recipientRole === 'all' || n.recipientRole === 'officer');
-    } else if (role === 'admin') {
-      // admin sees all notifications
     }
 
     res.json({ notifications: list });
@@ -750,7 +1695,8 @@ async function startServer() {
         (a) =>
           a.performedBy.toLowerCase().includes(q) ||
           a.details.toLowerCase().includes(q) ||
-          a.entityId.toLowerCase().includes(q)
+          a.entityId.toLowerCase().includes(q) ||
+          (a.hash && a.hash.toLowerCase().includes(q))
       );
     }
 
@@ -783,17 +1729,14 @@ async function startServer() {
       return res.status(404).json({ error: 'User not found' });
     }
     user.status = user.status === 'active' ? 'inactive' : 'active';
-    db.auditLogs.unshift({
-      id: `AUD-${Date.now()}`,
+    logAudit({
       action: 'USER_STATUS_TOGGLED',
       entityId: user.id,
       entityType: 'USER',
       performedBy: 'System Administrator',
       role: 'admin',
       details: `User ${user.name} (${user.role}) status changed to ${user.status}.`,
-      timestamp: new Date().toISOString(),
-      ipAddress: req.ip || '10.14.1.10',
-    });
+    }, req.ip || '10.14.1.10');
     saveDatabase(db);
     res.json({ success: true, user });
   });
@@ -804,17 +1747,14 @@ async function startServer() {
 
   app.put('/api/settings', (req, res) => {
     db.settings = { ...db.settings, ...req.body };
-    db.auditLogs.unshift({
-      id: `AUD-${Date.now()}`,
+    logAudit({
       action: 'SETTINGS_UPDATED',
       entityId: 'SETTINGS',
       entityType: 'SYSTEM',
       performedBy: 'System Administrator',
       role: 'admin',
-      details: 'Updated alert threshold rules and auto-verification policies.',
-      timestamp: new Date().toISOString(),
-      ipAddress: req.ip || '10.14.1.10',
-    });
+      details: 'Updated statutory rule thresholds, tenure, and scheduled bank configurations.',
+    }, req.ip || '10.14.1.10');
     saveDatabase(db);
     res.json({ success: true, settings: db.settings });
   });
@@ -822,6 +1762,9 @@ async function startServer() {
   app.get('/api/analytics', (req, res) => {
     const totalDeposits = db.fdrs.reduce((acc, f) => acc + (f.amount || 0), 0);
     const activeDeposits = db.fdrs.filter((f) => f.status === 'Active').reduce((acc, f) => acc + (f.amount || 0), 0);
+    const forfeitedDeposits = db.fdrs.filter((f) => f.status === 'Forfeited').reduce((acc, f) => acc + (f.amount || 0), 0);
+    const forfeitedCount = db.fdrs.filter((f) => f.status === 'Forfeited').length;
+    const forfeitureProposedCount = db.fdrs.filter((f) => f.status === 'Forfeiture Proposed').length;
 
     // Status breakdown
     const statusCounts: Record<string, number> = {};
@@ -844,7 +1787,7 @@ async function startServer() {
     }
     const depositsByState = Object.keys(stateMap).map((k) => ({
       state: k,
-      amount: stateMap[k].totalAmount / 100000, // in Lakhs
+      amount: stateMap[k].totalAmount / 100000,
       rawAmount: stateMap[k].totalAmount,
       count: stateMap[k].count,
     }));
@@ -858,26 +1801,23 @@ async function startServer() {
     }
     const topBanks = Object.keys(bankMap).map((k) => ({
       bank: k,
-      amount: bankMap[k].totalAmount / 100000, // in Lakhs
+      amount: bankMap[k].totalAmount / 100000,
       count: bankMap[k].count,
     })).sort((a, b) => b.amount - a.amount);
 
-    // Monthly Submissions computed dynamically from db.fdrs
     const months = ['May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct'];
     const monthlyMap: Record<string, { count: number; totalLakhs: number }> = {};
     months.forEach((m) => { monthlyMap[m] = { count: 0, totalLakhs: 0 }; });
 
-    // Seed baseline activity + live user submissions
     monthlyMap['May'] = { count: 12, totalLakhs: 180 };
     monthlyMap['Jun'] = { count: 18, totalLakhs: 290 };
     monthlyMap['Jul'] = { count: 24, totalLakhs: 410 };
     monthlyMap['Aug'] = { count: 32, totalLakhs: 520 };
     monthlyMap['Sep'] = { count: 29, totalLakhs: 460 };
     
-    // October submissions count from db.fdrs
     const octCount = db.fdrs.filter((f) => {
       const d = new Date(f.submissionDate);
-      return !isNaN(d.getTime()) && d.getMonth() === 9; // Oct is month index 9
+      return !isNaN(d.getTime()) && d.getMonth() === 9;
     }).length;
     const octLakhs = Math.round(
       db.fdrs
@@ -900,6 +1840,9 @@ async function startServer() {
       totalCount: db.fdrs.length,
       totalDeposits,
       activeDeposits,
+      forfeitedDeposits,
+      forfeitedCount,
+      forfeitureProposedCount,
       statusDistribution,
       depositsByState,
       topBanks,
@@ -910,6 +1853,7 @@ async function startServer() {
 
   // Reset seed
   app.post('/api/reset-seed', (req, res) => {
+    const chainedLogs = ensureHashChainedAuditLogs(INITIAL_AUDIT_LOGS);
     db = {
       institutions: INITIAL_INSTITUTIONS,
       users: INITIAL_USERS,
@@ -917,10 +1861,10 @@ async function startServer() {
       fdrs: INITIAL_FDRS,
       requests: INITIAL_REQUESTS,
       notifications: INITIAL_NOTIFICATIONS,
-      auditLogs: INITIAL_AUDIT_LOGS,
+      auditLogs: chainedLogs,
     };
     saveDatabase(db);
-    res.json({ success: true, message: 'Database reset to initial seed data' });
+    res.json({ success: true, message: 'Database reset to initial seed data with valid hash chain' });
   });
 
   // -------------------------------------------------------------

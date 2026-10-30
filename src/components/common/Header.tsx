@@ -11,6 +11,7 @@ interface HeaderProps {
   onOpenFdrDetail?: (fdrId: string) => void;
   activeLanguage?: 'EN' | 'HI';
   onToggleLanguage?: () => void;
+  onOpenArchitecture?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -22,6 +23,7 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenFdrDetail,
   activeLanguage = 'EN',
   onToggleLanguage,
+  onOpenArchitecture,
 }) => {
   const [showNotifications, setShowNotifications] = useState(false);
   const unreadCount = notifications.filter((n) => !n.read).length;
@@ -55,7 +57,16 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
 
           {/* Right Navigation & User Controls */}
-          <div className="flex items-center gap-3 sm:gap-4">
+          <div className="flex items-center gap-2 sm:gap-3">
+            {/* System Architecture Button */}
+            <button
+              onClick={onOpenArchitecture}
+              type="button"
+              className="hidden md:inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1.5 rounded-lg border border-[#C3E5D0] bg-[#EAF6EE] text-[#0B6B3A] hover:bg-[#d8eedf] transition-colors"
+            >
+              <span>🏛️ Architecture</span>
+            </button>
+
             {/* Language Toggle */}
             <button
               onClick={onToggleLanguage}

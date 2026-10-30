@@ -38,6 +38,17 @@ const INDIAN_BANKS = [
   'Kotak Mahindra Bank',
 ];
 
+const CATEGORIES = [
+  'Engineering & Technology',
+  'Management / MBA',
+  'Pharmacy',
+  'Polytechnic / Diploma',
+  'Architecture & Planning',
+  'MCA / Computer Applications',
+  'Applied Arts & Crafts',
+  'General / Others',
+];
+
 export const SubmitFDRWizard: React.FC<SubmitFDRWizardProps> = ({
   currentUser,
   onSuccess,
@@ -47,18 +58,26 @@ export const SubmitFDRWizard: React.FC<SubmitFDRWizardProps> = ({
   const [currentStep, setCurrentStep] = useState<number>(1);
   const [loading, setLoading] = useState(false);
   const [digiLockerLoading, setDigiLockerLoading] = useState(false);
+  const [extracting, setExtracting] = useState(false);
+  const [extractedData, setExtractedData] = useState<any>(null);
+  const [mismatches, setMismatches] = useState<string[]>([]);
+  const [extractionMode, setExtractionMode] = useState<string>('');
 
   // Form State
   const [formData, setFormData] = useState({
+    category: 'Engineering & Technology',
     bankName: 'State Bank of India',
     branchName: 'Kolkata Main Branch, Dalhousie',
     ifscCode: 'SBIN0000001',
-    fdrNumber: `SBI-2026-${Math.floor(1000 + Math.random() * 8990) * 2}`, // default even for clean verify
-    amount: 1500000,
+    fdrNumber: `SBI-2026-${Math.floor(1000 + Math.random() * 8990) * 2}`,
+    amount: 3500000,
     issueDate: new Date().toISOString().split('T')[0],
     maturityDate: new Date(Date.now() + 10 * 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
     interestRate: 7.25,
     purpose: 'Security Deposit for New UG Technical Programmes under AICTE APH 2025-26',
+    jointHolding: true,
+    jointHolderName: 'Member Secretary, AICTE',
+    lienEndorsementText: 'Irrevocably marked with first charge/lien in favour of Member Secretary, AICTE, New Delhi.',
   });
 
   const [documents, setDocuments] = useState<FDRDocument[]>([
@@ -78,6 +97,56 @@ export const SubmitFDRWizard: React.FC<SubmitFDRWizardProps> = ({
   // Drag and drop state
   const [isDragging, setIsDragging] = useState(false);
 
+  // Extract from uploaded file
+  const processAndExtractFile = async (file: File) => {
+    // Validate size: 10MB
+    if (file.size > 10 * 1024 * 1024) {
+      showToast({
+        type: 'error',
+        title: 'File Too Large',
+        message: 'File size exceeds maximum allowed 10 MB limit.',
+      });
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const base64Data = reader.result as string;
+      setExtracting(true);
+      try {
+        const res = await api.extractDocument({
+          fileData: base64Data,
+          fileName: file.name,
+          mimeType: file.type || 'application/pdf',
+          typedData: {
+            ...formData,
+            institutionName: currentUser.institutionName,
+          },
+        });
+
+        if (res.success && res.extractedData) {
+          setExtractedData(res.extractedData);
+          setMismatches(res.mismatches || []);
+          setExtractionMode(res.modeLabel || (res.isSimulated ? 'Demo mode: simulated extraction' : 'Gemini 3.8-Flash Vision Extraction'));
+          showToast({
+            type: 'success',
+            title: 'Certificate Analyzed',
+            message: `Extracted key deposit parameters (${res.isSimulated ? 'Simulated Engine' : 'Gemini 3.8-Flash Vision'}).`,
+          });
+        }
+      } catch (err: any) {
+        showToast({
+          type: 'error',
+          title: 'Extraction Error',
+          message: err.message || 'Failed to extract certificate details.',
+        });
+      } finally {
+        setExtracting(false);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
   // Handle Drag & Drop upload
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -94,6 +163,7 @@ export const SubmitFDRWizard: React.FC<SubmitFDRWizardProps> = ({
         verified: false,
       };
       setDocuments((prev) => [...prev, newDoc]);
+      processAndExtractFile(file);
       showToast({
         type: 'success',
         title: 'Document Uploaded',
@@ -211,6 +281,8 @@ export const SubmitFDRWizard: React.FC<SubmitFDRWizardProps> = ({
         aicteId: currentUser.aicteId || '1-932148291',
         submittedBy: currentUser.name,
         documents,
+        extractedData,
+        mismatches,
       });
 
       // Confetti celebration
@@ -294,6 +366,26 @@ export const SubmitFDRWizard: React.FC<SubmitFDRWizardProps> = ({
         {currentStep === 1 && (
           <div className="space-y-5">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-bold text-[#1E2A32] mb-1.5">
+                  Institution Category / Discipline <span className="text-red-500">*</span>
+                </label>
+                <select
+                  value={formData.category}
+                  onChange={(e) => setFormData({ ...formData, category: e.target.value })}
+                  className="w-full p-3 bg-[#F8FAFC] border border-[#E6E9EC] rounded-xl text-xs font-semibold text-[#1E2A32] focus:bg-white focus:ring-2 focus:ring-[#0B6B3A]"
+                >
+                  {CATEGORIES.map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-[10px] text-slate-400 mt-1 block">
+                  Determines statutory security deposit norm under AICTE APH 2025-26.
+                </span>
+              </div>
+
               <div>
                 <label className="block text-xs font-bold text-[#1E2A32] mb-1.5">
                   Participating Scheduled Bank <span className="text-red-500">*</span>
@@ -396,7 +488,7 @@ export const SubmitFDRWizard: React.FC<SubmitFDRWizardProps> = ({
 
               <div>
                 <label className="block text-xs font-bold text-[#1E2A32] mb-1.5">
-                  Maturity Date (10-Yr Lock-in) <span className="text-red-500">*</span>
+                  Maturity Date (Min 8-10 Yr Lock-in) <span className="text-red-500">*</span>
                 </label>
                 <input
                   type="date"
@@ -404,6 +496,24 @@ export const SubmitFDRWizard: React.FC<SubmitFDRWizardProps> = ({
                   onChange={(e) => setFormData({ ...formData, maturityDate: e.target.value })}
                   className="w-full p-3 bg-[#F8FAFC] border border-[#E6E9EC] rounded-xl text-xs font-semibold text-[#1E2A32] focus:bg-white focus:ring-2 focus:ring-[#0B6B3A]"
                 />
+              </div>
+
+              {/* Statutory Joint Holding Box */}
+              <div className="sm:col-span-2 p-3 bg-emerald-50/60 border border-emerald-200 rounded-xl">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={formData.jointHolding}
+                    onChange={(e) => setFormData({ ...formData, jointHolding: e.target.checked })}
+                    className="w-4 h-4 text-[#0B6B3A] rounded border-slate-300 focus:ring-[#0B6B3A]"
+                  />
+                  <span className="text-xs font-bold text-slate-800">
+                    Joint Holding Mandate: Pledged with "Member Secretary, AICTE"
+                  </span>
+                </label>
+                <p className="text-[11px] text-slate-600 mt-1 pl-6">
+                  Mandatory under Regulation 4(2): Deposit certificate must list the Institution and Member Secretary, AICTE as joint depositors with lien marked.
+                </p>
               </div>
 
               <div className="sm:col-span-2">
@@ -433,14 +543,21 @@ export const SubmitFDRWizard: React.FC<SubmitFDRWizardProps> = ({
           </div>
         )}
 
-        {/* STEP 2: DOCUMENT UPLOAD (Drag and Drop) */}
+        {/* STEP 2: DOCUMENT UPLOAD & GEMINI VISION EXTRACTION */}
         {currentStep === 2 && (
           <div className="space-y-6">
-            <div>
-              <h3 className="text-sm font-bold text-[#1E2A32]">Upload Scanned Deposit Slip & Lien Mandate</h3>
-              <p className="text-xs text-[#526471] mt-0.5">
-                Drag and drop authorized tripartite agreements or bank receipts in PDF format.
-              </p>
+            <div className="flex items-start justify-between">
+              <div>
+                <h3 className="text-sm font-bold text-[#1E2A32]">Upload Scanned Deposit Slip & Lien Mandate</h3>
+                <p className="text-xs text-[#526471] mt-0.5">
+                  Accepts PDF and JPG/PNG up to 10 MB. Server multimodal engine extracts and verifies statutory fields in real-time.
+                </p>
+              </div>
+              {extractionMode && (
+                <span className="text-[10px] font-semibold px-2.5 py-1 rounded-full bg-[#EAF6EE] text-[#0B6B3A] border border-[#C3E5D0]">
+                  {extractionMode}
+                </span>
+              )}
             </div>
 
             {/* Drag & Drop Zone */}
@@ -457,36 +574,157 @@ export const SubmitFDRWizard: React.FC<SubmitFDRWizardProps> = ({
                   : 'border-slate-300 bg-slate-50 hover:bg-slate-100/50'
               }`}
             >
-              <Upload className="w-10 h-10 text-[#0B6B3A] mx-auto mb-3" />
-              <p className="text-xs font-bold text-slate-800">
-                Drag and drop files here, or{' '}
-                <label className="text-[#0B6B3A] underline cursor-pointer">
-                  browse files
-                  <input
-                    type="file"
-                    className="hidden"
-                    onChange={(e) => {
-                      if (e.target.files && e.target.files[0]) {
-                        const file = e.target.files[0];
-                        setDocuments((prev) => [
-                          ...prev,
-                          {
-                            id: `DOC-UP-${Date.now()}`,
-                            name: file.name,
-                            type: file.type || 'application/pdf',
-                            size: `${(file.size / (1024 * 1024)).toFixed(1)} MB`,
-                            uploadDate: new Date().toISOString(),
-                            source: 'manual',
-                            verified: false,
-                          },
-                        ]);
-                      }
-                    }}
-                  />
-                </label>
-              </p>
-              <p className="text-[11px] text-slate-400 mt-1">Supported: PDF, JPG, PNG (Max 15MB)</p>
+              {extracting ? (
+                <div className="space-y-2 py-2">
+                  <RotateCw className="w-10 h-10 text-[#0B6B3A] animate-spin mx-auto" />
+                  <p className="text-xs font-bold text-slate-800">
+                    Multimodal Vision Analysis in Progress...
+                  </p>
+                  <p className="text-[11px] text-slate-500">
+                    Extracting bank name, FDR reference, deposit amount, and tripartite lien text...
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <Upload className="w-10 h-10 text-[#0B6B3A] mx-auto mb-3" />
+                  <p className="text-xs font-bold text-slate-800">
+                    Drag and drop certificate here, or{' '}
+                    <label className="text-[#0B6B3A] underline cursor-pointer">
+                      browse files
+                      <input
+                        type="file"
+                        accept=".pdf,.png,.jpg,.jpeg"
+                        className="hidden"
+                        onChange={(e) => {
+                          if (e.target.files && e.target.files[0]) {
+                            const file = e.target.files[0];
+                            setDocuments((prev) => [
+                              ...prev,
+                              {
+                                id: `DOC-UP-${Date.now()}`,
+                                name: file.name,
+                                type: file.type || 'application/pdf',
+                                size: `${(file.size / (1024 * 1024)).toFixed(1)} MB`,
+                                uploadDate: new Date().toISOString(),
+                                source: 'manual',
+                                verified: false,
+                              },
+                            ]);
+                            processAndExtractFile(file);
+                          }
+                        }}
+                      />
+                    </label>
+                  </p>
+                  <p className="text-[11px] text-slate-400 mt-1">Accepted: PDF, JPG, PNG up to 10 MB</p>
+                </>
+              )}
             </div>
+
+            {/* Mismatch Warning Alert */}
+            {mismatches.length > 0 && (
+              <div className="p-4 bg-red-50 border border-red-200 rounded-xl space-y-2 animate-in fade-in">
+                <div className="flex items-center gap-2 text-red-700 font-bold text-xs">
+                  <span>⚠️ Form & Certificate Discrepancy Alert ({mismatches.length})</span>
+                </div>
+                <ul className="list-disc pl-5 text-[11px] text-red-600 space-y-1">
+                  {mismatches.map((m, idx) => (
+                    <li key={idx}>{m}</li>
+                  ))}
+                </ul>
+                <p className="text-[10px] text-red-500">
+                  Please correct typed values or click "Sync Form with Extracted Data" to avoid scrutiny flags.
+                </p>
+              </div>
+            )}
+
+            {/* Real Extracted Fields Preview */}
+            {extractedData && (
+              <div className="p-4 bg-white rounded-2xl border border-slate-200 shadow-xs space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-[#0B6B3A]" />
+                    <span className="text-xs font-bold text-slate-900">Extracted Certificate Parameters</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFormData((prev) => ({
+                        ...prev,
+                        bankName: extractedData.bankName?.value || prev.bankName,
+                        fdrNumber: extractedData.fdrNumber?.value || prev.fdrNumber,
+                        amount: Number(extractedData.amount?.value) || prev.amount,
+                        issueDate: extractedData.issueDate?.value || prev.issueDate,
+                        maturityDate: extractedData.maturityDate?.value || prev.maturityDate,
+                      }));
+                      setMismatches([]);
+                      showToast({
+                        type: 'info',
+                        title: 'Form Synced',
+                        message: 'Deposit details updated from extracted certificate data.',
+                      });
+                    }}
+                    className="text-[11px] font-bold text-[#0B6B3A] hover:underline"
+                  >
+                    Sync Form with Extracted Data
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+                  <div className="p-2.5 bg-slate-50 rounded-xl">
+                    <span className="text-slate-400 block text-[10px]">Bank Name</span>
+                    <span className="font-semibold text-slate-800">{extractedData.bankName?.value}</span>
+                    <div className="mt-1">
+                      <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                        extractedData.bankName?.confidence < 85 ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'
+                      }`}>
+                        {extractedData.bankName?.confidence}% {extractedData.bankName?.confidence < 85 ? '• Needs Human Verification' : 'Conf'}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="p-2.5 bg-slate-50 rounded-xl">
+                    <span className="text-slate-400 block text-[10px]">FDR Number</span>
+                    <span className="font-semibold text-slate-800 font-mono">{extractedData.fdrNumber?.value}</span>
+                    <div className="mt-1">
+                      <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                        extractedData.fdrNumber?.confidence < 85 ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'
+                      }`}>
+                        {extractedData.fdrNumber?.confidence}% {extractedData.fdrNumber?.confidence < 85 ? '• Needs Human Verification' : 'Conf'}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="p-2.5 bg-slate-50 rounded-xl">
+                    <span className="text-slate-400 block text-[10px]">Amount</span>
+                    <span className="font-extrabold text-[#0B6B3A]">
+                      ₹{Number(extractedData.amount?.value).toLocaleString('en-IN')}
+                    </span>
+                    <div className="mt-1">
+                      <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                        extractedData.amount?.confidence < 85 ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'
+                      }`}>
+                        {extractedData.amount?.confidence}% {extractedData.amount?.confidence < 85 ? '• Needs Human Verification' : 'Conf'}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="p-2.5 bg-slate-50 rounded-xl">
+                    <span className="text-slate-400 block text-[10px]">Lien Clause</span>
+                    <span className="font-medium text-slate-800 truncate block text-[10px]">
+                      {extractedData.lienEndorsementText?.value || 'Clause detected'}
+                    </span>
+                    <div className="mt-1">
+                      <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                        extractedData.lienEndorsementText?.confidence < 85 ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'
+                      }`}>
+                        {extractedData.lienEndorsementText?.confidence}% {extractedData.lienEndorsementText?.confidence < 85 ? '• Needs Human Verification' : 'Conf'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Document list */}
             <div className="space-y-2">

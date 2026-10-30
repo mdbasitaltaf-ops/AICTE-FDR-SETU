@@ -29,10 +29,42 @@ export type FDRStatus =
   | 'Submitted' 
   | 'Under Review' 
   | 'Verified' 
+  | 'Lien Marked'
   | 'Active' 
   | 'Flagged' 
+  | 'Forfeiture Proposed'
+  | 'Forfeited'
   | 'Matured' 
   | 'Released';
+
+export interface ExtractedField {
+  value: string | number;
+  confidence: number; // 0 - 100
+  needsHumanVerification?: boolean;
+  confirmedByOfficer?: boolean;
+}
+
+export interface FDRExtractedData {
+  bankName?: ExtractedField;
+  fdrNumber?: ExtractedField;
+  depositorNames?: ExtractedField;
+  amount?: ExtractedField;
+  issueDate?: ExtractedField;
+  maturityDate?: ExtractedField;
+  interestRate?: ExtractedField;
+  lienEndorsementText?: ExtractedField;
+  isSimulated?: boolean;
+}
+
+export interface RuleResult {
+  id: string;
+  name: string;
+  passed: boolean;
+  critical: boolean;
+  reason: string;
+  expected?: string;
+  actual?: string;
+}
 
 export interface PublicFDR {
   id: string;
@@ -77,6 +109,7 @@ export interface FDR {
   institutionId: string;
   institutionName: string;
   aicteId: string;
+  category?: string;
   bankName: string;
   branchName: string;
   ifscCode: string;
@@ -89,6 +122,35 @@ export interface FDR {
   status: FDRStatus;
   lienStatus: 'Active Lien' | 'Pending Lien' | 'Released Lien';
   lienId: string;
+  jointHolding?: boolean;
+  jointHolderName?: string;
+  lienEndorsementText?: string;
+  bankLienVerified?: boolean;
+  extractedData?: FDRExtractedData;
+  officerConfirmedData?: Record<string, string | number>;
+  mismatches?: string[];
+  ruleResults?: RuleResult[];
+  overrideReason?: string;
+  forfeitureDetails?: {
+    reason: string;
+    showCauseRef: string;
+    proposedBy: string;
+    proposedAt: string;
+    officerNote?: string;
+    approvedBy?: string;
+    approvedAt?: string;
+    rejectedBy?: string;
+    rejectedAt?: string;
+    institutionResponse?: string;
+    institutionRespondedAt?: string;
+  };
+  releaseRecommendation?: {
+    recommendedBy: string;
+    recommendedAt: string;
+    recommendationNote?: string;
+    counterSignedBy?: string;
+    counterSignedAt?: string;
+  };
   autoVerificationStatus: 'matched' | 'mismatched' | 'pending';
   aiCheckStatus: 'passed' | 'warning' | 'failed';
   aiCheckNotes: string[];
@@ -136,6 +198,8 @@ export interface AuditLog {
   details: string;
   timestamp: string;
   ipAddress: string;
+  prevHash?: string;
+  hash?: string;
 }
 
 export interface SystemSettings {
@@ -143,7 +207,12 @@ export interface SystemSettings {
     days90: boolean;
     days60: boolean;
     days30: boolean;
+    unverifiedLienDays7: boolean;
+    discrepancyAlerts: boolean;
   };
   autoVerifyEnabled: boolean;
   maxLienDurationYears: number;
+  categoryThresholds: Record<string, number>;
+  minTenureYears: number;
+  scheduledBanks: string[];
 }

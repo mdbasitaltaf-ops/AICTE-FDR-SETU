@@ -2,5 +2,7 @@
   "name": "AICTE FDR Setu",
   "description": "Official national digital portal for AICTE Fixed Deposit Receipts (FDRs), paperless institutional security deposit lodgement, real-time banking verification, and compliance monitoring.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

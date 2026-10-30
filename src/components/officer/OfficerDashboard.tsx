@@ -37,12 +37,13 @@ export const OfficerDashboard: React.FC<OfficerDashboardProps> = ({
   onRefreshData,
 }) => {
   const { showToast } = useToast();
-  const [activeTab, setActiveTab] = useState<'queue' | 'all' | 'requests'>('queue');
+  const [activeTab, setActiveTab] = useState<'queue' | 'renewal_queue' | 'all' | 'requests'>('queue');
   const [searchQuery, setSearchQuery] = useState('');
   
   // Officer Review Console state
   const [reviewingFdr, setReviewingFdr] = useState<FDR | null>(null);
   const [reviewRemarks, setReviewRemarks] = useState('');
+  const [overrideReason, setOverrideReason] = useState('');
   const [actionLoading, setActionLoading] = useState(false);
 
   // Simulated 2-second loader for Bank verification
@@ -60,17 +61,22 @@ export const OfficerDashboard: React.FC<OfficerDashboardProps> = ({
   const stats = useMemo(() => {
     const pendingReview = fdrs.filter((f) => f.status === 'Submitted' || f.status === 'Under Review').length;
     const flagged = fdrs.filter((f) => f.status === 'Flagged').length;
-    
-    // Approved today (simulated)
     const approvedToday = fdrs.filter((f) => f.status === 'Active' || f.status === 'Verified').length;
 
     // Expiring soon (30 days)
     const now = new Date();
     const expiringSoon = fdrs.filter((f) => {
-      if (f.status === 'Released') return false;
+      if (f.status === 'Released' || f.status === 'Forfeited') return false;
       const mat = new Date(f.maturityDate);
       const diffDays = Math.ceil((mat.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
       return diffDays <= 30 && diffDays >= 0;
+    }).length;
+
+    const renewalQueueCount = fdrs.filter((f) => {
+      if (f.status === 'Released' || f.status === 'Forfeited') return false;
+      const mat = new Date(f.maturityDate);
+      const diffDays = Math.ceil((mat.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+      return diffDays <= 90;
     }).length;
 
     return {
@@ -78,6 +84,7 @@ export const OfficerDashboard: React.FC<OfficerDashboardProps> = ({
       flagged,
       approvedToday,
       expiringSoon,
+      renewalQueueCount,
       pendingRequests: requests.filter((r) => r.status === 'pending').length,
     };
   }, [fdrs, requests]);
@@ -95,6 +102,36 @@ export const OfficerDashboard: React.FC<OfficerDashboardProps> = ({
           f.fdrNumber.toLowerCase().includes(q) ||
           f.bankName.toLowerCase().includes(q)
         );
+      });
+  }, [fdrs, searchQuery]);
+
+  // Renewal Priority Queue: Sorted by Days to Maturity (ascending) & Amount (descending)
+  const renewalPriorityQueue = useMemo(() => {
+    const now = new Date();
+    return fdrs
+      .filter((f) => f.status !== 'Released' && f.status !== 'Forfeited')
+      .map((f) => {
+        const mat = new Date(f.maturityDate);
+        const daysToMaturity = Math.ceil((mat.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+        return { ...f, daysToMaturity };
+      })
+      .filter((f) => {
+        if (!searchQuery) return true;
+        const q = searchQuery.toLowerCase();
+        return (
+          f.trackingId.toLowerCase().includes(q) ||
+          f.institutionName.toLowerCase().includes(q) ||
+          f.fdrNumber.toLowerCase().includes(q) ||
+          f.bankName.toLowerCase().includes(q)
+        );
+      })
+      .sort((a, b) => {
+        // Sort primary by days to maturity ascending (urgent first)
+        if (a.daysToMaturity !== b.daysToMaturity) {
+          return a.daysToMaturity - b.daysToMaturity;
+        }
+        // Sort secondary by amount descending (highest deposit first)
+        return b.amount - a.amount;
       });
   }, [fdrs, searchQuery]);
 
@@ -116,9 +153,9 @@ export const OfficerDashboard: React.FC<OfficerDashboardProps> = ({
   const startReview = async (fdr: FDR) => {
     setReviewingFdr(fdr);
     setReviewRemarks('');
+    setOverrideReason(fdr.overrideReason || '');
     setBankCheckResult(null);
 
-    // Run AI check immediately
     const aiRes = await api.runAiCheck(fdr.fdrNumber, fdr.status);
     setAiCheckResult(aiRes);
   };
@@ -166,14 +203,40 @@ export const OfficerDashboard: React.FC<OfficerDashboardProps> = ({
       return;
     }
 
+    // Critical rule check
+    const criticalFailed = reviewingFdr.ruleResults?.some((r) => r.critical && !r.passed);
+    if (action === 'approve' && criticalFailed && !overrideReason.trim()) {
+      showToast({
+        type: 'error',
+        title: 'Approval Blocked',
+        message: 'Critical statutory rules failed. A recorded Scrutiny Override Reason is required to proceed.',
+      });
+      return;
+    }
+
     setActionLoading(true);
     try {
-      await api.reviewFdr(reviewingFdr.id, action, reviewRemarks, currentUser.name);
+      // Use reviewFdr which passes overrideReason to server
+      const res = await fetch(`/api/fdrs/${reviewingFdr.id}/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action,
+          remarks: reviewRemarks,
+          officerName: currentUser.name,
+          overrideReason: overrideReason.trim(),
+        }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || 'Scrutiny action failed');
+      }
 
       showToast({
         type: action === 'approve' ? 'success' : action === 'reject' ? 'error' : 'info',
         title: `Scrutiny Completed: ${action.toUpperCase()}`,
-        message: `FDR ${reviewingFdr.trackingId} updated. Audit log entry and institution alert created.`,
+        message: `FDR ${reviewingFdr.trackingId} updated. State transition and hash-chained audit log recorded.`,
       });
 
       setReviewingFdr(null);
@@ -302,6 +365,22 @@ export const OfficerDashboard: React.FC<OfficerDashboardProps> = ({
             }`}
           >
             All Institutional FDRs ({fdrs.length})
+          </button>
+
+          <button
+            onClick={() => setActiveTab('renewal_queue')}
+            className={`py-3 border-b-2 transition-colors flex items-center gap-1.5 ${
+              activeTab === 'renewal_queue'
+                ? 'border-[#0B6B3A] text-[#0B6B3A]'
+                : 'border-transparent hover:text-slate-800'
+            }`}
+          >
+            <span>Renewal Priority Queue</span>
+            {stats.renewalQueueCount > 0 && (
+              <span className="text-[10px] bg-red-100 text-red-800 px-2 py-0.5 rounded-full font-bold">
+                {stats.renewalQueueCount}
+              </span>
+            )}
           </button>
 
           <button
@@ -561,6 +640,126 @@ export const OfficerDashboard: React.FC<OfficerDashboardProps> = ({
                   </div>
                 ))
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 4: RENEWAL PRIORITY QUEUE */}
+      {activeTab === 'renewal_queue' && (
+        <div className="space-y-4">
+          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 p-4 bg-gradient-to-r from-red-50/60 to-amber-50/60 rounded-2xl border border-red-200">
+            <div>
+              <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                <Clock className="w-4 h-4 text-red-600" />
+                <span>Statutory Renewal Priority Queue</span>
+              </h3>
+              <p className="text-xs text-slate-600 mt-0.5">
+                Automatically prioritized by maturity urgency (days remaining ascending) and principal deposit amount (highest first).
+              </p>
+            </div>
+            <span className="text-xs font-mono font-bold px-3 py-1 bg-white text-slate-700 rounded-xl border border-slate-200">
+              {renewalPriorityQueue.length} Active Deposits Monitored
+            </span>
+          </div>
+
+          <div className="bg-white rounded-2xl border border-[#E6E9EC] overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-50 border-b border-[#E6E9EC] text-slate-500 font-bold uppercase text-[10px]">
+                  <tr>
+                    <th className="p-4">Urgency & Term</th>
+                    <th className="p-4">Institution & AICTE PID</th>
+                    <th className="p-4">FDR Ref / Bank</th>
+                    <th className="p-4">Deposit Amount</th>
+                    <th className="p-4">Maturity Date</th>
+                    <th className="p-4 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#E6E9EC]">
+                  {renewalPriorityQueue.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="p-8 text-center text-slate-400 text-xs">
+                        No deposits approaching maturity found.
+                      </td>
+                    </tr>
+                  ) : (
+                    renewalPriorityQueue.map((fdr) => {
+                      const isCritical = fdr.daysToMaturity <= 30 && fdr.daysToMaturity >= 0;
+                      const isWarning = fdr.daysToMaturity > 30 && fdr.daysToMaturity <= 60;
+                      const isUpcoming = fdr.daysToMaturity > 60 && fdr.daysToMaturity <= 90;
+                      const isPast = fdr.daysToMaturity < 0;
+
+                      return (
+                        <tr key={fdr.id} className="hover:bg-slate-50/80 transition-colors">
+                          <td className="p-4">
+                            {isPast ? (
+                              <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-red-100 text-red-900 border border-red-300">
+                                MATURED / EXPIRED
+                              </span>
+                            ) : isCritical ? (
+                              <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-red-100 text-red-800 border border-red-200 animate-pulse flex items-center gap-1 w-fit">
+                                <AlertCircle className="w-3 h-3 text-red-600" />
+                                <span>CRITICAL: {fdr.daysToMaturity} Days Left</span>
+                              </span>
+                            ) : isWarning ? (
+                              <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-amber-100 text-amber-800 border border-amber-200">
+                                WARNING: {fdr.daysToMaturity} Days
+                              </span>
+                            ) : isUpcoming ? (
+                              <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-blue-100 text-blue-800 border border-blue-200">
+                                UPCOMING: {fdr.daysToMaturity} Days
+                              </span>
+                            ) : (
+                              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-slate-100 text-slate-600">
+                                {fdr.daysToMaturity} Days Remaining
+                              </span>
+                            )}
+                          </td>
+                          <td className="p-4">
+                            <p className="font-bold text-slate-900">{fdr.institutionName}</p>
+                            <p className="text-[11px] text-slate-400 font-mono">{fdr.aicteId}</p>
+                          </td>
+                          <td className="p-4">
+                            <p className="font-mono font-bold text-slate-800">{fdr.fdrNumber}</p>
+                            <p className="text-[11px] text-slate-500">{fdr.bankName}</p>
+                          </td>
+                          <td className="p-4">
+                            <span className="font-extrabold text-[#0B6B3A] text-sm tabular-nums">
+                              ₹{fdr.amount.toLocaleString('en-IN')}
+                            </span>
+                          </td>
+                          <td className="p-4">
+                            <span className="font-medium text-slate-700">{fdr.maturityDate}</span>
+                          </td>
+                          <td className="p-4 text-right">
+                            <div className="flex items-center justify-end gap-2">
+                              <button
+                                onClick={() => onOpenFdrDetail(fdr.id)}
+                                className="px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-semibold text-slate-700 hover:bg-slate-100 transition-colors"
+                              >
+                                View Scrutiny
+                              </button>
+                              <button
+                                onClick={() => {
+                                  showToast({
+                                    type: 'success',
+                                    title: 'Renewal Notice Issued',
+                                    message: `Official renewal mandate sent to ${fdr.institutionName}.`,
+                                  });
+                                }}
+                                className="px-3 py-1.5 rounded-lg bg-[#0B6B3A] text-white text-xs font-bold hover:bg-[#08552E] transition-colors"
+                              >
+                                Issue Notice
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
             </div>
           </div>
         </div>
